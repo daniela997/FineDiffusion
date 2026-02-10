@@ -65,46 +65,114 @@ class TimestepEmbedder(nn.Module):
         return t_emb
 
 
+# class LabelEmbedder(nn.Module):
+#     """
+#     Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
+#     """
+
+#     def __init__(self, num_classes, num_super_classes, hidden_size, dropout_prob):
+#         super().__init__()
+#         use_cfg_embedding = dropout_prob > 0
+#         # self.embedding_table = nn.Embedding(num_classes + use_cfg_embedding, hidden_size)
+#         # 11 superclass embeddings
+#         if use_cfg_embedding:
+#             self.embedding_table = nn.Embedding(num_classes + num_super_classes, hidden_size)
+
+#         self.num_classes = num_classes
+#         self.num_super_classes = num_super_classes
+#         self.dropout_prob = dropout_prob
+
+
+#     def token_drop(self, labels, force_drop_ids=None):
+#         """
+#         Drops labels to enable classifier-free guidance.
+#         """
+#         if force_drop_ids is None:
+#             drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
+#         else:
+#             drop_ids = force_drop_ids == 1
+        
+#         # subclass->superclass
+#         map_list = torch.ones([10000],device=labels.device) * 10  # Animalia
+#         map_list[5729:9999 + 1] = 0  # Plants
+#         map_list[175:2700 + 1] = 1  # Insects
+#         map_list[3111:4596 + 1] = 2  # Birds
+#         map_list[5388:5728 + 1] = 3  # Fungi
+#         map_list[4859:5171 + 1] = 4  # Reptiles
+#         map_list[4613:4858 + 1] = 5  # Mammals
+#         map_list[2756:2938 + 1] = 6  # Ray-finned Fishes
+#         map_list[2939:3108 + 1] = 7  # Amphibians
+#         map_list[5219:5387 + 1] = 8  # Mollusks
+#         map_list[4:156 + 1] = 9  # Arachnids
+        
+#         labels[drop_ids] = map_list[labels[drop_ids]].long() + self.num_classes
+        
+#         return labels
+
+#     def forward(self, labels, train, force_drop_ids=None):
+#         use_dropout = self.dropout_prob > 0
+#         if (train and use_dropout) or (force_drop_ids is not None):
+#             labels = self.token_drop(labels, force_drop_ids)
+#         embeddings = self.embedding_table(labels)
+#         return embeddings
+
 class LabelEmbedder(nn.Module):
     """
     Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
+    Supports dynamic class-to-superclass mapping for different datasets.
     """
 
-    def __init__(self, num_classes, num_super_classes, hidden_size, dropout_prob):
+    def __init__(self, num_classes, num_super_classes, hidden_size, dropout_prob, class_to_superclass=None):
         super().__init__()
         use_cfg_embedding = dropout_prob > 0
-        # self.embedding_table = nn.Embedding(num_classes + use_cfg_embedding, hidden_size)
-        # 11 superclass embeddings
+        # Embedding table for all classes + superclasses (for classifier-free guidance)
         if use_cfg_embedding:
             self.embedding_table = nn.Embedding(num_classes + num_super_classes, hidden_size)
 
         self.num_classes = num_classes
         self.num_super_classes = num_super_classes
         self.dropout_prob = dropout_prob
+        
+        # Store class-to-superclass mapping
+        # If not provided, will be set later before forward pass
+        self.class_to_superclass = class_to_superclass
 
+    def set_class_to_superclass_mapping(self, class_to_superclass):
+        """
+        Set the class-to-superclass mapping.
+        :param class_to_superclass: dict mapping class_idx -> superclass_idx, or tensor of shape [num_classes]
+        """
+        if isinstance(class_to_superclass, dict):
+            # Convert dict to tensor
+            mapping = torch.zeros(self.num_classes, dtype=torch.long)
+            for cls_idx, sc_idx in class_to_superclass.items():
+                mapping[cls_idx] = sc_idx
+            self.class_to_superclass = mapping
+        else:
+            # Assume it's already a tensor
+            self.class_to_superclass = class_to_superclass
 
     def token_drop(self, labels, force_drop_ids=None):
         """
         Drops labels to enable classifier-free guidance.
+        Maps dropped class labels to their corresponding superclass labels.
         """
+        if self.class_to_superclass is None:
+            raise RuntimeError("class_to_superclass mapping not set. Call set_class_to_superclass_mapping() first.")
+        
         if force_drop_ids is None:
             drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
         else:
             drop_ids = force_drop_ids == 1
         
-        # subclass->superclass
-        map_list = torch.ones([10000],device=labels.device) * 10  # Animalia
-        map_list[5729:9999 + 1] = 0  # Plants
-        map_list[175:2700 + 1] = 1  # Insects
-        map_list[3111:4596 + 1] = 2  # Birds
-        map_list[5388:5728 + 1] = 3  # Fungi
-        map_list[4859:5171 + 1] = 4  # Reptiles
-        map_list[4613:4858 + 1] = 5  # Mammals
-        map_list[2756:2938 + 1] = 6  # Ray-finned Fishes
-        map_list[2939:3108 + 1] = 7  # Amphibians
-        map_list[5219:5387 + 1] = 8  # Mollusks
-        map_list[4:156 + 1] = 9  # Arachnids
+        # Move mapping to same device as labels
+        if isinstance(self.class_to_superclass, torch.Tensor):
+            map_list = self.class_to_superclass.to(labels.device)
+        else:
+            map_list = self.class_to_superclass
         
+        # Map dropped class labels to superclass labels
+        # superclass_label = num_classes + map_list[class_label]
         labels[drop_ids] = map_list[labels[drop_ids]].long() + self.num_classes
         
         return labels
@@ -115,8 +183,6 @@ class LabelEmbedder(nn.Module):
             labels = self.token_drop(labels, force_drop_ids)
         embeddings = self.embedding_table(labels)
         return embeddings
-
-
 
 #################################################################################
 #                                 Core DiT Model                                #

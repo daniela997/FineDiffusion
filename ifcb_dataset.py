@@ -1,0 +1,119 @@
+"""
+Custom dataset for IFCB plankton images with taxonomic superclass mapping.
+"""
+import pandas as pd
+from pathlib import Path
+from PIL import Image
+import torch
+from torch.utils.data import Dataset
+
+
+class IFCBTrainDataset(Dataset):
+    """
+    Dataset for IFCB images that:
+    1. Loads only images in the training split (from ifcb_train.csv)
+    2. Maps folder names (species) to class indices
+    3. Maps classes to superclasses (Phyla) from taxonomy
+    """
+    
+    def __init__(self, data_path, train_csv_path, records_csv_path, transform=None):
+        """
+        Args:
+            data_path: Path to root directory containing species subdirectories
+            train_csv_path: Path to ifcb_train.csv
+            records_csv_path: Path to ifcb_records.csv (for taxonomy)
+            transform: torchvision transforms to apply to images
+        """
+        self.data_path = Path(data_path)
+        self.transform = transform
+        
+        # Load CSVs
+        self.train_df = pd.read_csv(train_csv_path)
+        self.records_df = pd.read_csv(records_csv_path)
+        
+        # Get set of training image filenames
+        self.train_image_names = set(self.train_df['image'].values)
+        
+        # Create superclass mapping from Phylum
+        unique_phyla = sorted(self.records_df['Phylum'].dropna().unique())
+        self.phylum_to_superclass_id = {phylum: i for i, phylum in enumerate(unique_phyla)}
+        
+        # Create mapping from folder name to superclass ID
+        self.folder_to_superclass = {}
+        for folder in self.records_df['Folder'].unique():
+            phylum = self.records_df[self.records_df['Folder'] == folder]['Phylum'].iloc[0]
+            if pd.notna(phylum):
+                self.folder_to_superclass[folder] = self.phylum_to_superclass_id[phylum]
+        
+        # Build list of (image_path, class_idx, folder_name)
+        self.samples = []
+        self.class_to_idx = {}
+        self.class_to_folder = {}
+        class_idx = 0
+        
+        for folder in sorted(self.data_path.iterdir()):
+            if folder.is_dir():
+                self.class_to_idx[folder.name] = class_idx
+                self.class_to_folder[class_idx] = folder.name
+                
+                for img_path in folder.glob('*.png'):
+                    if img_path.name in self.train_image_names:
+                        self.samples.append((str(img_path), class_idx, folder.name))
+                
+                class_idx += 1
+        
+        # Store metadata
+        self.num_classes = class_idx
+        self.num_superclasses = len(self.phylum_to_superclass_id)
+        self.class_names = [self.class_to_folder[i] for i in range(self.num_classes)]
+        self.superclass_names = [sc for sc, _ in sorted(self.phylum_to_superclass_id.items(), 
+                                                         key=lambda x: x[1])]
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        img_path, class_idx, folder_name = self.samples[idx]
+        
+        # Load and process image
+        img = Image.open(img_path).convert('RGB')
+        if self.transform:
+            img = self.transform(img)
+        
+        return img, class_idx
+    
+    def get_superclass(self, class_idx):
+        """Get superclass ID for a given class index."""
+        folder_name = self.class_to_folder.get(class_idx)
+        if folder_name:
+            return self.folder_to_superclass.get(folder_name, 0)
+        return 0
+    
+    def get_class_name(self, class_idx):
+        """Get folder/species name for a class index."""
+        return self.class_to_folder.get(class_idx, "Unknown")
+    
+    def get_superclass_name(self, superclass_idx):
+        """Get Phylum name for a superclass index."""
+        if 0 <= superclass_idx < len(self.superclass_names):
+            return self.superclass_names[superclass_idx]
+        return "Unknown"
+    
+    def get_stats(self):
+        """Return dataset statistics."""
+        stats = {
+            'num_images': len(self.samples),
+            'num_classes': self.num_classes,
+            'num_superclasses': self.num_superclasses,
+            'class_names': self.class_names,
+            'superclass_names': self.superclass_names,
+        }
+        
+        # Count images per superclass
+        superclass_counts = {}
+        for _, class_idx, folder_name in self.samples:
+            sc_idx = self.folder_to_superclass.get(folder_name, 0)
+            superclass_counts[sc_idx] = superclass_counts.get(sc_idx, 0) + 1
+        stats['superclass_counts'] = superclass_counts
+        
+        return stats

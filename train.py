@@ -16,7 +16,6 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from torchvision.datasets import ImageFolder
 from torchvision import transforms
 import numpy as np
 from collections import OrderedDict
@@ -27,11 +26,15 @@ from time import time
 import argparse
 import logging
 import os
+import wandb
+import torchvision
+from torch.cuda.amp import autocast, GradScaler
 
 from models import DiT_models
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
 from download import find_model
+from ifcb_dataset import IFCBTrainDataset
 
 #################################################################################
 #                             Training Helper Functions                         #
@@ -82,6 +85,93 @@ def create_logger(logging_dir):
         logger.addHandler(logging.NullHandler())
     return logger
 
+def pad_to_square(pil_image, target_size, strip=4):
+    """
+    Resize and pad PIL Image to square.
+    - First resizes so the longer dimension = target_size (preserves aspect ratio)
+    - Then pads with edge-tiled strips to make exactly square
+    
+    Args:
+        pil_image: PIL Image
+        target_size: target square size (e.g., 256)
+        strip: number of edge pixels to use for tiling
+    
+    Returns:
+        Padded square PIL Image of size (target_size, target_size)
+    """
+    import numpy as np
+    
+    image = np.array(pil_image)
+    
+    if len(image.shape) == 2:
+        image = np.stack([image] * 3, axis=-1)
+        was_grayscale = True
+    else:
+        was_grayscale = False
+    
+    H, W = image.shape[:2]
+    
+    # Resize so longest dimension = target_size (preserves aspect ratio, no upscaling)
+    if max(H, W) > target_size:
+        scale = target_size / max(H, W)
+        new_H, new_W = int(H * scale), int(W * scale)
+        image = np.array(Image.fromarray(image).resize((new_W, new_H), Image.BICUBIC))
+        H, W = new_H, new_W
+    
+    # Now pad to make square
+    pad_vertical = target_size - H
+    pad_top = np.random.randint(0, pad_vertical + 1) if pad_vertical > 0 else 0
+    pad_bottom = pad_vertical - pad_top
+    
+    pad_horizontal = target_size - W
+    pad_left = np.random.randint(0, pad_horizontal + 1) if pad_horizontal > 0 else 0
+    pad_right = pad_horizontal - pad_left
+    
+    padded = np.pad(image, ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)), mode='edge')
+    
+    def tile_patch(patch, shape):
+        reps = (
+            (shape[0] + patch.shape[0] - 1) // patch.shape[0],
+            (shape[1] + patch.shape[1] - 1) // patch.shape[1],
+            1,
+        )
+        tiled = np.tile(patch, reps)
+        return tiled[:shape[0], :shape[1]]
+    
+    # Replace padding with tiled edge strips
+    if pad_top:
+        patch = image[:strip, :, :]
+        padded[:pad_top, pad_left:W + pad_left] = tile_patch(patch, (pad_top, W))
+    if pad_bottom:
+        patch = image[-strip:, :, :][::-1]
+        padded[-pad_bottom:, pad_left:W + pad_left] = tile_patch(patch, (pad_bottom, W))
+    if pad_left:
+        patch = image[:, :strip, :]
+        padded[pad_top:H + pad_top, :pad_left] = tile_patch(patch, (H, pad_left))
+    if pad_right:
+        patch = image[:, -strip:, :][:, ::-1, :]
+        padded[pad_top:H + pad_top, -pad_right:] = tile_patch(patch, (H, pad_right))
+    
+    # Add noise to padded regions
+    mask = np.zeros(padded.shape[:2], dtype=bool)
+    if pad_top:
+        mask[:pad_top, :] = True
+    if pad_bottom:
+        mask[-pad_bottom:, :] = True
+    if pad_left:
+        mask[:, :pad_left] = True
+    if pad_right:
+        mask[:, -pad_right:] = True
+    
+    mask3 = np.repeat(mask[:, :, None], padded.shape[2], axis=2)
+    masked_pixels = padded[mask3].copy()
+    masked_pixels = masked_pixels.reshape(-1, 3)
+    np.random.shuffle(masked_pixels)
+    padded[mask3] = masked_pixels.reshape(-1)
+    padded = np.clip(padded, 0, 255).astype(np.uint8)
+    
+    result = Image.fromarray(padded if not was_grayscale else padded[:, :, 0])
+    return result
 
 def center_crop_arr(pil_image, image_size):
     """
@@ -103,6 +193,80 @@ def center_crop_arr(pil_image, image_size):
     crop_x = (arr.shape[1] - image_size) // 2
     return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
 
+# def generate_samples(ema_model, diffusion, vae, class_labels, num_timesteps, device, dataset, logger):
+#     """
+#     Generate samples using the EMA model for specified class labels.
+    
+#     Args:
+#         class_labels: tensor of class indices to generate for
+#     """
+#     torch.set_grad_enabled(False)
+    
+#     num_samples = len(class_labels)
+    
+#     # Create noise
+#     latent_size = 256 // 8
+#     z = torch.randn(num_samples, 4, latent_size, latent_size, device=device)
+    
+#     # Setup classifier-free guidance
+#     z = torch.cat([z, z], 0)
+    
+#     # Get superclass labels for guidance
+#     superclass_labels = torch.tensor([dataset.get_superclass(c.item()) for c in class_labels], device=device)
+#     y = torch.cat([class_labels, superclass_labels + dataset.num_classes], 0)
+    
+#     model_kwargs = dict(y=y, cfg_scale=4.0)
+    
+#     # Sample
+#     samples = diffusion.p_sample_loop(
+#         ema_model.forward_with_cfg, z.shape, z, clip_denoised=False, 
+#         model_kwargs=model_kwargs, progress=False, device=device
+#     )
+#     samples, _ = samples.chunk(2, dim=0)
+    
+#     # Decode from latent space
+#     samples = vae.decode(samples / 0.18215).sample
+    
+#     torch.set_grad_enabled(True)
+    
+#     return samples
+
+def generate_samples(ema_model, diffusion, vae, class_labels, num_timesteps, device, dataset, logger):
+    """
+    Generate samples using the EMA model for specified class labels.
+    """
+    torch.set_grad_enabled(False)
+    
+    # Use fp16 for faster inference
+    with torch.autocast(device_type='cuda', dtype=torch.float16):
+        num_samples = len(class_labels)
+        
+        # Create noise
+        latent_size = 256 // 8
+        z = torch.randn(num_samples, 4, latent_size, latent_size, device=device)
+        
+        # Setup classifier-free guidance
+        z = torch.cat([z, z], 0)
+        
+        # Get superclass labels
+        superclass_labels = torch.tensor([dataset.get_superclass(c.item()) for c in class_labels], device=device)
+        y = torch.cat([class_labels, superclass_labels + dataset.num_classes], 0)
+        
+        model_kwargs = dict(y=y, cfg_scale=4.0)
+        
+        # Sample
+        samples = diffusion.p_sample_loop(
+            ema_model.forward_with_cfg, z.shape, z, clip_denoised=False, 
+            model_kwargs=model_kwargs, progress=False, device=device
+        )
+        samples, _ = samples.chunk(2, dim=0)
+        
+        # Decode from latent space
+        samples = vae.decode(samples / 0.18215).sample
+    
+    torch.set_grad_enabled(True)
+    
+    return samples
 
 #################################################################################
 #                                  Training Loop                                #
@@ -145,6 +309,22 @@ def main(args):
         num_classes=args.num_classes,
         num_super_classes=args.num_super_classes
     )
+        # Initialize wandb
+    if rank == 0:
+        wandb.init(
+            project="finediffusion-ifcb",
+            name=f"{experiment_index:03d}-{model_string_name}",
+            config={
+                "model": args.model,
+                "image_size": args.image_size,
+                "num_classes": args.num_classes,
+                "num_super_classes": args.num_super_classes,
+                "global_batch_size": args.global_batch_size,
+                "epochs": args.epochs,
+                "learning_rate": 1e-4,
+            },
+            dir=experiment_dir
+        )
 
     logger.info("resume_model:")
     logger.info(args.resume)
@@ -164,9 +344,9 @@ def main(args):
         else:
             param.requires_grad = False
 
-    for name, param in model.named_parameters():
-        logger.info(name)
-        logger.info(param.requires_grad)
+    # for name, param in model.named_parameters():
+    #     logger.info(name)
+    #     logger.info(param.requires_grad)
     
     
     # Note that parameter initialization is done within the DiT constructor
@@ -175,6 +355,7 @@ def main(args):
     model = DDP(model.to(device), device_ids=[rank])
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
 
@@ -189,14 +370,63 @@ def main(args):
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
 
+    # If checkpoint provided, load it to resume training
+    if args.checkpoint:
+        logger.info(f"Loading training checkpoint from {args.checkpoint}")
+        checkpoint_data = torch.load(args.checkpoint, map_location=lambda storage, loc: storage)
+        
+        model.module.load_state_dict(checkpoint_data['model'])
+        ema.load_state_dict(checkpoint_data['ema'])
+        opt.load_state_dict(checkpoint_data['opt'])
+
+
+        for name, param in model.named_parameters():
+
+            if ('y_embedder.embedding_table.weight' in name) or ('bias' in name) or ('norm' in name):
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+
+        requires_grad(ema, False)
+
+        for name, param in ema.named_parameters():
+            logger.info(name)
+            logger.info(param.requires_grad)
+
+        # Move optimizer state to device
+        for state in opt.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
+
+        logger.info(f"DiT Parameters with requires_grad=True: {total_parameters:,}")
+
+        start_epoch = checkpoint_data.get('epoch', 0)
+        start_step = checkpoint_data.get('train_steps', 0)
+        logger.info(f"Resumed from epoch {start_epoch}, step {start_step}")
+
     # Setup data:
+    # transform = transforms.Compose([
+    #     transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
+    #     transforms.RandomHorizontalFlip(),
+    #     transforms.ToTensor(),
+    #     transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+    # ])
+
     transform = transforms.Compose([
-        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
+        transforms.Lambda(lambda pil_image: pad_to_square(pil_image, args.image_size)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
-    dataset = ImageFolder(args.data_path, transform=transform)
+    
+    dataset = IFCBTrainDataset(
+        data_path=args.data_path,
+        train_csv_path="/scratch/datasets/other/IFCB_FishNet_Format/anns/ifcb_train.csv",
+        records_csv_path="/scratch/datasets/other/IFCB_FishNet_Format/anns/ifcb_records.csv",
+        transform=transform
+    )
+    
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),
@@ -213,9 +443,26 @@ def main(args):
         pin_memory=True,
         drop_last=True
     )
-    logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
-
-    logger.info(f"Dataset contains  {args.num_classes} classes in {args.num_super_classes} superclasses")
+    # Automatic Mixed Precision
+    scaler = GradScaler()
+    # Log dataset info
+    stats = dataset.get_stats()
+    logger.info(f"Dataset contains {stats['num_images']:,} images from training split ({args.data_path})")
+    logger.info(f"Found {stats['num_superclasses']} superclasses (Phyla):")
+    # for sc_idx, sc_name in enumerate(stats['superclass_names']):
+    #     count = stats['superclass_counts'].get(sc_idx, 0)
+    #     logger.info(f"  Superclass {sc_idx}: {sc_name} ({count} images)")
+    
+    # Set the class-to-superclass mapping in the model's label embedder
+    # Build mapping from class_idx -> superclass_idx
+    class_to_superclass_mapping = torch.zeros(dataset.num_classes, dtype=torch.long)
+    for class_idx in range(dataset.num_classes):
+        superclass_idx = dataset.get_superclass(class_idx)
+        class_to_superclass_mapping[class_idx] = superclass_idx
+    
+    # Pass mapping to the label embedder
+    model.module.y_embedder.set_class_to_superclass_mapping(class_to_superclass_mapping)
+    logger.info(f"Dataset contains {stats['num_classes']} classes in {stats['num_superclasses']} superclasses")
 
     # Prepare models for training:
     update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
@@ -223,28 +470,55 @@ def main(args):
     ema.eval()  # EMA model should always be in eval mode
 
     # Variables for monitoring/logging purposes:
-    train_steps = 0
+    train_steps = start_step  # Will be 0 if not resuming, or the saved step count if resuming   
     log_steps = 0
     running_loss = 0
     start_time = time()
-
+    # Pre-sample fixed class labels for periodic generation during training
+    num_fixed_samples = 16
+    fixed_sample_classes = torch.randint(0, dataset.num_classes, (num_fixed_samples,), device=device)
+    logger.info(f"Fixed sample classes: {[dataset.get_class_name(c.item()) for c in fixed_sample_classes]}")
+    if rank == 0:
+        try:
+            logger.info(f"Generating samples at step {train_steps}...")
+            samples = generate_samples(
+                ema, diffusion, vae, fixed_sample_classes,
+                num_timesteps=250, device=device, 
+                dataset=dataset, logger=logger
+            )
+            # Create grid and log
+            sample_grid = torchvision.utils.make_grid(samples, nrow=4, normalize=True, value_range=(-1, 1))
+            
+            # Log to wandb with class info
+            class_names = [dataset.get_class_name(c.item()) for c in fixed_sample_classes[:]]
+            wandb.log({
+                "samples": wandb.Image(sample_grid, caption=f"{class_names}"),
+            }, step=train_steps)
+            
+            logger.info(f"Sample generation complete")
+        except Exception as e:
+            logger.warning(f"Failed to generate samples: {e}")
+    dist.barrier()
     logger.info(f"Training for {args.epochs} epochs...")
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
         for x, y in loader:
             x = x.to(device)
             y = y.to(device)
             with torch.no_grad():
-                # Map input images to latent space + normalize latents:
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             model_kwargs = dict(y=y)
-            loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
-            loss = loss_dict["loss"].mean()
+            
+            with autocast():
+                loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
+                loss = loss_dict["loss"].mean()
+            
             opt.zero_grad()
-            loss.backward()
-            opt.step()
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
             update_ema(ema, model.module)
 
             # Log loss values:
@@ -266,6 +540,13 @@ def main(args):
                 log_steps = 0
                 start_time = time()
 
+                if rank == 0:
+                    wandb.log({
+                        "train/loss": avg_loss,
+                        "train/steps_per_sec": steps_per_sec,
+                        "train/step": train_steps,
+                    })
+
             # Save DiT checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
@@ -273,12 +554,48 @@ def main(args):
                         "model": model.module.state_dict(),
                         "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
-                        "args": args
+                        "args": args,
+                        "epoch": epoch,
+                        "train_steps": train_steps
                     }
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
+                    
+                    # Keep only the last N checkpoints to save disk space
+                    import glob as glob_module
+                    checkpoints = sorted(glob_module.glob(f"{checkpoint_dir}/*.pt"))
+                    num_to_keep = 1  # Keep the last checkpoint
+                    if len(checkpoints) > num_to_keep:
+                        for old_ckpt in checkpoints[:-num_to_keep]:
+                            try:
+                                os.remove(old_ckpt)
+                                logger.info(f"Deleted old checkpoint: {old_ckpt}")
+                            except Exception as e:
+                                logger.warning(f"Failed to delete {old_ckpt}: {e}")
+                
+                    # Generate and log samples
+                    try:
+                        logger.info(f"Generating samples at step {train_steps}...")
+                        samples = generate_samples(
+                            ema, diffusion, vae, fixed_sample_classes,
+                            num_timesteps=250, device=device, 
+                            dataset=dataset, logger=logger
+                        )
+                        # Create grid and log
+                        sample_grid = torchvision.utils.make_grid(samples, nrow=4, normalize=True, value_range=(-1, 1))
+                        
+                        # Log to wandb with class info
+                        class_names = [dataset.get_class_name(c.item()) for c in fixed_sample_classes[:]]
+                        wandb.log({
+                            "samples": wandb.Image(sample_grid, caption=f"{class_names}"),
+                        }, step=train_steps)
+                        
+                        logger.info(f"Sample generation complete")
+                    except Exception as e:
+                        logger.warning(f"Failed to generate samples: {e}")
                 dist.barrier()
+            
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
@@ -291,7 +608,10 @@ if __name__ == "__main__":
     # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
     
-    parser.add_argument("--resume", type=str, default='pretrained_models/DiT-XL-2-256x256.pt')
+    parser.add_argument("--resume", type=str, default='DiT-XL-2-256x256.pt',
+                        help="Pretrained model to initialize from")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Training checkpoint to resume from (overrides resume)")
     parser.add_argument("--data-path", type=str, default="datasets/train_mini")
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
