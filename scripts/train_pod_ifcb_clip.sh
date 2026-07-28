@@ -34,12 +34,18 @@ CLIP_CODE_DIM="${CLIP_CODE_DIM:-0}"
 # batch, same steps per epoch — at the cost of sublinear speedup on more GPUs.
 NPROC="${NPROC:-4}"
 GLOBAL_BS="${GLOBAL_BS:-64}"
-# Dataloader workers PER RANK, so the total is NUM_WORKERS x NPROC. pad_to_square costs
-# ~24ms/image (BICUBIC resize + edge-strip tiling + per-pixel shuffle of the padding), so
-# one worker sustains only ~41 img/s. At 32/GPU x 2 GPUs, 3 steps/s needs ~192 img/s ≈ 5
-# workers; 4 per rank (8 total on an 8-CPU pod) leaves headroom without oversubscribing.
-# Default sized for the 8-CPU pods: NUM_WORKERS x NPROC should be <= CPU count.
-NUM_WORKERS="${NUM_WORKERS:-4}"
+# Dataloader workers PER RANK, so the pod total is NUM_WORKERS x NPROC. This MUST stay at or
+# below the pod's CPU count — oversubscribing makes throughput WORSE, not better.
+# pad_to_square costs ~23ms/image, so one worker sustains only ~44 img/s. Measured per rank
+# at batch 32 (2 ranks, so double the proc count for the pod total):
+#     1 worker/rank   38 img/s   1.17 steps/s
+#     2 workers/rank  79 img/s   2.48 steps/s   <- the ceiling on a 4-CPU pod
+#     3 workers/rank 112 img/s   3.49 steps/s
+#     4 workers/rank 181 img/s   5.67 steps/s   <- needs an 8-CPU pod
+# On a 4-CPU / 2-GPU pod the loader caps you near 2.5 steps/s, which is roughly what 4090s
+# compute anyway — so that shape is dataloader-bound and an 8-CPU pod is worth preferring.
+# Default 2 suits the 4-CPU pods; raise to 4 on an 8-CPU pod.
+NUM_WORKERS="${NUM_WORKERS:-2}"
 PREFETCH="${PREFETCH:-6}"
 
 export IFCB_ANNS="$DATA/anns"
