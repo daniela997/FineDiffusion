@@ -60,7 +60,7 @@ fi
 if [ -f "$DEST/anns/ifcb_train.csv" ] && [ -d "$DEST/Images" ]; then
     log "IFCB already staged at $DEST — skipping"
 else
-    log "downloading $HF_REPO -> $DEST (2.3GB, 74181 images; the slow step)"
+    log "downloading $HF_REPO -> $DEST (2.3GB: Images.tar + anns)"
     "$PY" - <<PYEOF
 from huggingface_hub import snapshot_download
 p = snapshot_download(repo_id="$HF_REPO", repo_type="dataset",
@@ -73,9 +73,12 @@ fi
 # If the repo holds Images.tar (the --tar upload path: 1 file instead of 74181, far faster
 # in both directions), unpack it into the layout the training code walks.
 if [ -f "$DEST/Images.tar" ] && [ ! -d "$DEST/Images" ]; then
-    log "unpacking Images.tar"
+    log "unpacking Images.tar (74181 files; a few minutes on the shared volume)"
     tar xf "$DEST/Images.tar" -C "$DEST" || { log "UNTAR FAILED"; sleep infinity; }
+    # Drop the archive only after a successful extract — 2.3GB back, and re-running the
+    # script then re-downloads rather than silently finding a half-extracted tree.
     rm -f "$DEST/Images.tar"
+    log "unpacked; removed the archive"
 fi
 
 # ---- pretrained DiT-XL/2 checkpoint (2.7GB, public, straight from FAIR) -------------
