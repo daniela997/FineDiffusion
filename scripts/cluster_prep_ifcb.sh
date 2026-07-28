@@ -81,6 +81,24 @@ else
         || { log "DiT download FAILED"; sleep infinity; }
 fi
 
+# ---- repos onto the shared volume ---------------------------------------------------
+# BOTH are needed later: FineDiffusion to train, hyperbolic-plankton because the LoRA
+# checkpoint is adapters over an open_clip backbone — make_clip_embeddings.py imports
+# HyperbolicCLIP/apply_lora to rebuild the encoder. Cloning here (CPU pod, cheap) means the
+# GPU pod starts straight into work.
+clone_or_pull() {
+    _dir="$1"; _url="$2"
+    if [ -d "$_dir/.git" ]; then
+        log "updating $(basename "$_dir")"
+        git -C "$_dir" pull --ff-only || log "  pull failed; keeping existing checkout"
+    else
+        log "cloning $(basename "$_dir")"
+        git clone "$_url" "$_dir" || log "  clone FAILED for $_url"
+    fi
+}
+clone_or_pull /mnt/resources/FineDiffusion        https://github.com/daniela997/FineDiffusion.git
+clone_or_pull /mnt/resources/hyperbolic-plankton  https://github.com/daniela997/hyperbolic-plankton.git
+
 # ---- report ------------------------------------------------------------------------
 log "staged contents:"
 du -sh "$DEST"/* 2>/dev/null
@@ -88,6 +106,19 @@ N=$(find "$DEST/Images" -name '*.png' 2>/dev/null | wc -l)
 log "image count: $N (expected 74181)"
 [ "$N" -eq 74181 ] || log "WARNING: image count does not match — check the upload"
 
+log ""
 log "PREP DONE. Training pods read from $DEST"
+log "NEXT (on the GPU pod, once the planktonzilla sweep has a checkpoint):"
+log "  1. pull the sweep's best ckpt:"
+log "       cd /mnt/resources/hyperbolic-plankton"
+log "       python scripts/pull_ckpt.py uofg/hyperbolic-plankton-sweep/<artifact>:latest \\"
+log "           --out /mnt/resources/hyperbolic_plankton_ckpts/from_cluster"
+log "  2. generate the conditioning embeddings from it:"
+log "       cd /mnt/resources/FineDiffusion"
+log "       PYTHONPATH=/mnt/resources/hyperbolic-plankton/src python scripts/make_clip_embeddings.py \\"
+log "           --ckpt <the .pt> --records $DEST/anns/ifcb_records.csv \\"
+log "           --images $DEST/Images --out ifcb_rd32_v5.npz --name rd_r32_participation"
+log "  3. run scripts/train_pod_ifcb_clip.sh (point --clip-embeddings at that npz)"
+log ""
 log "holding pod open so you can inspect; stop it manually."
 sleep infinity

@@ -14,6 +14,9 @@ DATA=/mnt/datasets/ifcb_finediffusion
 VENV=/root/fd-venv
 PY="$VENV/bin/python"
 RESULTS=/mnt/resources/finediffusion_clip_results
+# The conditioning embeddings. Generate with scripts/make_clip_embeddings.py from the
+# planktonzilla LoRA checkpoint; override by exporting CLIP_NPZ before running this script.
+CLIP_NPZ="${CLIP_NPZ:-$REPO_DIR/ifcb_rd32_hierarchical_embeddings.npz}"
 
 export IFCB_ANNS="$DATA/anns"
 export PYTHONUNBUFFERED=1
@@ -42,12 +45,15 @@ cd "$REPO_DIR" || { log "no repo at $REPO_DIR"; sleep infinity; }
 # ---- venv on LOCAL disk --------------------------------------------------------------
 command -v uv >/dev/null 2>&1 || { log "installing uv"; curl -LsSf https://astral.sh/uv/install.sh | sh; }
 uv python install 3.12
-if ! "$PY" -c "import torch,diffusers,timm,wandb,pandas" 2>/dev/null; then
+# open_clip_torch + peft are for scripts/make_clip_embeddings.py, which imports
+# hyperbolic_plankton to rebuild the LoRA-CLIP text encoder — one venv covers both steps.
+if ! "$PY" -c "import torch,diffusers,timm,wandb,pandas,open_clip,peft" 2>/dev/null; then
     log "building $VENV (3.12) + GPU torch + deps"
     rm -rf "$VENV"
     uv venv --python 3.12 "$VENV"
     VIRTUAL_ENV="$VENV" uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-    VIRTUAL_ENV="$VENV" uv pip install diffusers timm wandb pandas numpy pillow
+    VIRTUAL_ENV="$VENV" uv pip install diffusers timm wandb pandas numpy pillow \
+        open_clip_torch peft huggingface_hub
 else
     log "venv ready at $VENV"
 fi
@@ -58,6 +64,18 @@ if ! "$PY" train.py --help 2>&1 | grep -q "clip-embeddings"; then
     log "FATAL: --clip-embeddings missing — checkout predates the ClipEmbedder commit. Holding open."
     sleep infinity
 fi
+# The conditioning .npz is NOT in git — it is generated from a LoRA checkpoint by
+# scripts/make_clip_embeddings.py. Fail here rather than after the VAE + DiT have loaded.
+if [ ! -f "$CLIP_NPZ" ]; then
+    log "FATAL: no conditioning embeddings at $CLIP_NPZ"
+    log "  generate them first:"
+    log "    PYTHONPATH=/mnt/resources/hyperbolic-plankton/src $PY scripts/make_clip_embeddings.py \\"
+    log "        --ckpt <lora.pt> --records $DATA/anns/ifcb_records.csv \\"
+    log "        --images $DATA/Images --out <out.npz> --name <tag>"
+    log "  then re-run with CLIP_NPZ=<out.npz>. Holding pod open."
+    sleep infinity
+fi
+log "conditioning: $CLIP_NPZ"
 
 mkdir -p "$RESULTS"
 
@@ -77,7 +95,7 @@ log "launching FineDiffusion-CLIP on 4 GPUs (global batch 64)"
     --anns-dir "$DATA/anns" \
     --num-classes 145 \
     --num-super-classes 12 \
-    --clip-embeddings "$REPO_DIR/ifcb_rd32_hierarchical_embeddings.npz" \
+    --clip-embeddings "$CLIP_NPZ" \
     --clip-code-dim 32 \
     --epochs 150 \
     --global-batch-size 64 \
