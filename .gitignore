@@ -1,2 +1,9 @@
 __pycache__/
 diffusion/__pycache__
+# Large binary artifacts (regenerable / reference docs)
+*.npz
+*.pdf
+*.pt
+*.pth
+*.ckpt
+*.safetensors

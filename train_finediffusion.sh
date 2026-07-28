@@ -9,11 +9,11 @@ cd /home/daniela/other/FineDiffusion
 torchrun --nnodes=1 --nproc_per_node=2 train.py \
   --model DiT-XL/2 \
   --resume /scratch/daniela/.cache/finediffusion/DiT-XL-2-256x256.pt\
-  --checkpoint /scratch/daniela/finediffusion_results/000-DiT-XL-2/checkpoints/0015000.pt \
+  --checkpoint /scratch/daniela/finediffusion_results/011-DiT-XL-2/checkpoints/0110000.pt \
   --data-path /scratch/datasets/other/IFCB_FishNet_Format/Images \
   --num-classes 145 \
   --num-super-classes 12 \
-  --epochs 120 \
+  --epochs 150 \
   --global-batch-size 64 \
   --image-size 256 \
   --results-dir /scratch/daniela/finediffusion_results \

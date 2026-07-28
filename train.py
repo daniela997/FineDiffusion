@@ -235,36 +235,43 @@ def generate_samples(ema_model, diffusion, vae, class_labels, num_timesteps, dev
     """
     Generate samples using the EMA model for specified class labels.
     """
+    # try/finally: a failure here must NOT leave grad globally disabled, or the next
+    # training-loop backward raises "does not require grad".
     torch.set_grad_enabled(False)
-    
-    # Use fp16 for faster inference
-    with torch.autocast(device_type='cuda', dtype=torch.float16):
-        num_samples = len(class_labels)
-        
-        # Create noise
-        latent_size = 256 // 8
-        z = torch.randn(num_samples, 4, latent_size, latent_size, device=device)
-        
-        # Setup classifier-free guidance
-        z = torch.cat([z, z], 0)
-        
-        # Get superclass labels
-        superclass_labels = torch.tensor([dataset.get_superclass(c.item()) for c in class_labels], device=device)
-        y = torch.cat([class_labels, superclass_labels + dataset.num_classes], 0)
-        
-        model_kwargs = dict(y=y, cfg_scale=4.0)
-        
-        # Sample
-        samples = diffusion.p_sample_loop(
-            ema_model.forward_with_cfg, z.shape, z, clip_denoised=False, 
-            model_kwargs=model_kwargs, progress=False, device=device
-        )
-        samples, _ = samples.chunk(2, dim=0)
-        
-        # Decode from latent space
-        samples = vae.decode(samples / 0.18215).sample
-    
-    torch.set_grad_enabled(True)
+    try:
+        # Use fp16 for faster inference
+        with torch.autocast(device_type='cuda', dtype=torch.float16):
+            num_samples = len(class_labels)
+
+            # Create noise
+            latent_size = 256 // 8
+            z = torch.randn(num_samples, 4, latent_size, latent_size, device=device)
+
+            # Setup classifier-free guidance
+            z = torch.cat([z, z], 0)
+
+            # Build the doubled label tensor [conditional ; null]. With ClipEmbedder the null is
+            # produced internally by forward_with_cfg (coarse Phylum CLIP), so both halves are the
+            # plain class labels. With LabelEmbedder the second half is the superclass-row trick.
+            if getattr(ema_model, "use_clip_embedder", False):
+                y = torch.cat([class_labels, class_labels], 0)
+            else:
+                superclass_labels = torch.tensor([dataset.get_superclass(c.item()) for c in class_labels], device=device)
+                y = torch.cat([class_labels, superclass_labels + dataset.num_classes], 0)
+
+            model_kwargs = dict(y=y, cfg_scale=4.0)
+
+            # Sample
+            samples = diffusion.p_sample_loop(
+                ema_model.forward_with_cfg, z.shape, z, clip_denoised=False,
+                model_kwargs=model_kwargs, progress=False, device=device
+            )
+            samples, _ = samples.chunk(2, dim=0)
+
+            # Decode from latent space
+            samples = vae.decode(samples / 0.18215).sample
+    finally:
+        torch.set_grad_enabled(True)
     
     return samples
 
@@ -304,10 +311,25 @@ def main(args):
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     latent_size = args.image_size // 8
+
+    # Optionally condition on precomputed LoRA-CLIP taxonomy embeddings (ClipEmbedder).
+    clip_species = clip_coarse = None
+    if args.clip_embeddings:
+        z = np.load(args.clip_embeddings, allow_pickle=True)
+        clip_species = z["clip_emb_species"]   # (C, clip_dim) full-lineage condition
+        clip_coarse = z["clip_emb_coarse"]     # (C, clip_dim) Phylum-truncated CFG null
+        assert clip_species.shape[0] == args.num_classes, (
+            f"clip table has {clip_species.shape[0]} classes but --num-classes={args.num_classes}")
+        logger.info(f"Conditioning on CLIP embeddings from {args.clip_embeddings} "
+                    f"(model={z['clip_model']}, dim={clip_species.shape[1]})")
+
     model = DiT_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes,
-        num_super_classes=args.num_super_classes
+        num_super_classes=args.num_super_classes,
+        clip_species=clip_species,
+        clip_coarse=clip_coarse,
+        clip_code_dim=args.clip_code_dim,
     )
         # Initialize wandb
     if rank == 0:
@@ -333,16 +355,19 @@ def main(args):
     
     if args.resume:
         state_dict = find_model(args.resume)
+        # Drop the pretrained lookup-table row (incompatible with ClipEmbedder, and re-learned
+        # anyway for LabelEmbedder since num_classes differs from the pretrained checkpoint).
         state_dict.pop('y_embedder.embedding_table.weight', None)
         model.load_state_dict(state_dict, strict=False)
 
+    # Parameter-efficient fine-tune: train the conditioning embedder + biases + norms, freeze
+    # the rest of the pretrained DiT. For ClipEmbedder this trains the projection MLP and the
+    # per-class code (the frozen CLIP tables are buffers, so they never get requires_grad).
+    def _is_trainable(name):
+        return ('y_embedder.' in name) or ('bias' in name) or ('norm' in name)
 
     for name, param in model.named_parameters():
-
-        if ('y_embedder.embedding_table.weight' in name) or ('bias' in name) or ('norm' in name):
-            param.requires_grad = True
-        else:
-            param.requires_grad = False
+        param.requires_grad = _is_trainable(name)
 
     # for name, param in model.named_parameters():
     #     logger.info(name)
@@ -370,6 +395,10 @@ def main(args):
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
 
+    # Defaults for a fresh run (no --checkpoint); overwritten below if resuming a checkpoint.
+    start_epoch = 0
+    start_step = 0
+
     # If checkpoint provided, load it to resume training
     if args.checkpoint:
         logger.info(f"Loading training checkpoint from {args.checkpoint}")
@@ -381,11 +410,7 @@ def main(args):
 
 
         for name, param in model.named_parameters():
-
-            if ('y_embedder.embedding_table.weight' in name) or ('bias' in name) or ('norm' in name):
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
+            param.requires_grad = _is_trainable(name)
 
         requires_grad(ema, False)
 
@@ -453,15 +478,16 @@ def main(args):
     #     count = stats['superclass_counts'].get(sc_idx, 0)
     #     logger.info(f"  Superclass {sc_idx}: {sc_name} ({count} images)")
     
-    # Set the class-to-superclass mapping in the model's label embedder
-    # Build mapping from class_idx -> superclass_idx
-    class_to_superclass_mapping = torch.zeros(dataset.num_classes, dtype=torch.long)
-    for class_idx in range(dataset.num_classes):
-        superclass_idx = dataset.get_superclass(class_idx)
-        class_to_superclass_mapping[class_idx] = superclass_idx
-    
-    # Pass mapping to the label embedder
-    model.module.y_embedder.set_class_to_superclass_mapping(class_to_superclass_mapping)
+    # Set the class-to-superclass mapping in the model's label embedder. Only the
+    # LabelEmbedder needs it (its CFG dropout maps a class to its Phylum superclass row).
+    # ClipEmbedder carries the coarse (Phylum) null in its own clip_coarse table, so it has
+    # no such method — skip in that case.
+    if not model.module.use_clip_embedder:
+        class_to_superclass_mapping = torch.zeros(dataset.num_classes, dtype=torch.long)
+        for class_idx in range(dataset.num_classes):
+            superclass_idx = dataset.get_superclass(class_idx)
+            class_to_superclass_mapping[class_idx] = superclass_idx
+        model.module.y_embedder.set_class_to_superclass_mapping(class_to_superclass_mapping)
     logger.info(f"Dataset contains {stats['num_classes']} classes in {stats['num_superclasses']} superclasses")
 
     # Prepare models for training:
@@ -625,5 +651,11 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=5000)
+    parser.add_argument("--clip-embeddings", type=str, default=None,
+                        help="Path to precomputed CLIP taxonomy embeddings .npz "
+                             "(keys clip_emb_species, clip_emb_coarse). Enables ClipEmbedder "
+                             "conditioning instead of the learned lookup table.")
+    parser.add_argument("--clip-code-dim", type=int, default=32,
+                        help="Dim of the trainable per-class hybrid code in ClipEmbedder.")
     args = parser.parse_args()
     main(args)

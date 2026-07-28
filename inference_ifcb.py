@@ -17,10 +17,11 @@ from models import DiT_models
 from ifcb_dataset import IFCBTrainDataset
 import argparse
 import pandas as pd
+import torchvision.transforms as transforms
 
 def main(args):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
+    device = args.device
+    print(f"Using device: {device}")
     # Load dataset to get class-to-superclass mapping
     print("Loading dataset for class mappings...")
     dataset = IFCBTrainDataset(
@@ -43,7 +44,8 @@ def main(args):
     checkpoint = torch.load(args.ckpt, map_location=lambda storage, loc: storage)
     
     if isinstance(checkpoint, dict) and 'model' in checkpoint:
-        model.load_state_dict(checkpoint['model'])
+        model.load_state_dict(checkpoint['ema'])
+        print("Loaded EMA model")
     else:
         model.load_state_dict(checkpoint)
     
@@ -74,23 +76,29 @@ def main(args):
             
             print(f"[{class_idx+1}/{args.num_classes}] {class_name} ({superclass_name})")
             
-            # Generate samples_per_class images
-            for sample_num in range(args.samples_per_class):
-                torch.manual_seed(args.seed + class_idx * 1000 + sample_num)
-                torch.set_grad_enabled(False)
+            # Generate samples_per_class images in batches
+            batch_size = min(args.samples_per_class, 32)  # Adjust based on GPU memory
+            num_batches = (args.samples_per_class + batch_size - 1) // batch_size
+            
+            for batch_idx in range(num_batches):
+                batch_start = batch_idx * batch_size
+                batch_end = min(batch_start + batch_size, args.samples_per_class)
+                current_batch_size = batch_end - batch_start
                 
-                # Create noise
-                z = torch.randn(1, 4, latent_size, latent_size, device=device)
-                y = torch.tensor([class_idx], device=device)
+                torch.manual_seed(args.seed + class_idx * 1000 + batch_start)
+                
+                # Create noise for entire batch
+                z = torch.randn(current_batch_size, 4, latent_size, latent_size, device=device)
+                y = torch.tensor([class_idx] * current_batch_size, device=device)
                 
                 # Setup classifier-free guidance
                 z = torch.cat([z, z], 0)
-                y_super = torch.tensor([dataset.get_superclass(class_idx) + args.num_classes], device=device)
+                y_super = torch.tensor([dataset.get_superclass(class_idx) + args.num_classes] * current_batch_size, device=device)
                 y = torch.cat([y, y_super], 0)
                 
                 model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
                 
-                # Sample image
+                # Sample batch
                 samples = diffusion.p_sample_loop(
                     model.forward_with_cfg, z.shape, z, clip_denoised=False,
                     model_kwargs=model_kwargs, progress=False, device=device
@@ -98,12 +106,20 @@ def main(args):
                 samples, _ = samples.chunk(2, dim=0)
                 samples = vae.decode(samples / 0.18215).sample
                 
-                # Save image in output_dir/class_name/subcategory_B/
+                # Save all images in batch
                 class_dir = os.path.join(output_dir, class_name, "subcategory_B")
                 os.makedirs(class_dir, exist_ok=True)
                 
-                file_path = os.path.join(class_dir, f"sample_{sample_num:02d}.png")
-                save_image(samples, file_path, normalize=True, value_range=(-1, 1))
+                for i, sample in enumerate(samples):
+                    sample_num = batch_start + i
+                    file_path = os.path.join(class_dir, f"sample_{sample_num:02d}.png")
+                    
+                    # Convert to PIL, then to grayscale
+                    pil_img = transforms.ToPILImage()(
+                        sample.clamp(-1, 1).add(1).div(2)
+                    )
+                    grayscale_img = pil_img.convert("L").convert("RGB")
+                    grayscale_img.save(file_path)
     
     print(f"Done! Samples saved to {output_dir}")
 
@@ -125,6 +141,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-sampling-steps", type=int, default=250)
     parser.add_argument("--samples-per-class", type=int, default=10,
                         help="Number of samples to generate per class")
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)  
+    parser.add_argument("--device", type=str, default="cuda:1")
     args = parser.parse_args()
     main(args)

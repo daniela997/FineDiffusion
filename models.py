@@ -184,6 +184,80 @@ class LabelEmbedder(nn.Module):
         embeddings = self.embedding_table(labels)
         return embeddings
 
+
+class ClipEmbedder(nn.Module):
+    """Conditions the DiT on precomputed (LoRA-CLIP) taxonomy text embeddings instead of a
+    learned lookup table.
+
+    Drop-in for LabelEmbedder: forward(labels, train, force_drop_ids) takes integer class
+    indices and returns (N, hidden_size), so DiT.forward is unchanged. The class identity
+    enters via two precomputed, FROZEN per-class tables (both indexed by class_idx):
+
+      - clip_species : (C, clip_dim)  full-lineage CLIP text embedding (the condition)
+      - clip_coarse  : (C, clip_dim)  Phylum-truncated CLIP text embedding (the CFG null)
+
+    The coarse rank is PHYLUM, matching the previous LabelEmbedder whose CFG dropout mapped
+    each class to its Phylum superclass row.
+
+    Hybrid: the species CLIP vector is concatenated with a small TRAINABLE per-class code
+    before projection. CLIP carries the taxonomy prior + zero-shot structure; the per-class
+    code recovers distinctions CLIP text cannot encode (e.g. morphotype folders whose
+    lineage strings are identical, so their CLIP vectors are identical).
+
+    CFG dropout (hierarchical null): dropped samples are conditioned on the COARSE (Phylum)
+    CLIP embedding instead of a learned constant — the FineDiffusion superclass-guidance
+    idea, realized in CLIP space (guide the species condition away from its coarse prior).
+    The per-class code is zeroed for dropped samples so the null carries no fine identity.
+    """
+
+    def __init__(self, clip_species, clip_coarse, hidden_size, dropout_prob,
+                 code_dim=32, proj_hidden=None):
+        super().__init__()
+        clip_species = torch.as_tensor(clip_species, dtype=torch.float32)
+        clip_coarse = torch.as_tensor(clip_coarse, dtype=torch.float32)
+        assert clip_species.shape == clip_coarse.shape, "species/coarse tables must align"
+        self.num_classes, clip_dim = clip_species.shape
+        self.dropout_prob = dropout_prob
+
+        # Frozen precomputed CLIP tables (buffers -> move with .to(device), not trained).
+        self.register_buffer("clip_species", clip_species)
+        self.register_buffer("clip_coarse", clip_coarse)
+
+        # Trainable per-class code (hybrid tie-breaker). Zeroed for the null.
+        self.code = nn.Embedding(self.num_classes, code_dim)
+        nn.init.normal_(self.code.weight, std=0.02)
+        self.code_dim = code_dim
+
+        proj_hidden = proj_hidden or hidden_size
+        self.mlp = nn.Sequential(
+            nn.Linear(clip_dim + code_dim, proj_hidden, bias=True),
+            nn.SiLU(),
+            nn.Linear(proj_hidden, hidden_size, bias=True),
+        )
+
+    def token_drop(self, labels, force_drop_ids=None):
+        """Return a boolean mask of which samples to replace with the coarse null."""
+        if force_drop_ids is None:
+            drop = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
+        else:
+            drop = force_drop_ids == 1
+        return drop
+
+    def forward(self, labels, train, force_drop_ids=None):
+        labels = labels.long()
+        clip_vec = self.clip_species[labels]                 # (N, clip_dim)
+        code = self.code(labels)                             # (N, code_dim)
+
+        use_dropout = self.dropout_prob > 0
+        if (train and use_dropout) or (force_drop_ids is not None):
+            drop = self.token_drop(labels, force_drop_ids).unsqueeze(1)  # (N, 1)
+            # Hierarchical null: swap species CLIP -> coarse (Phylum) CLIP, zero the code.
+            clip_vec = torch.where(drop, self.clip_coarse[labels], clip_vec)
+            code = torch.where(drop, torch.zeros_like(code), code)
+
+        return self.mlp(torch.cat([clip_vec, code], dim=1))  # (N, hidden_size)
+
+
 #################################################################################
 #                                 Core DiT Model                                #
 #################################################################################
@@ -252,6 +326,9 @@ class DiT(nn.Module):
             num_classes=1000,
             num_super_classes=1,
             learn_sigma=True,
+            clip_species=None,
+            clip_coarse=None,
+            clip_code_dim=32,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -262,7 +339,16 @@ class DiT(nn.Module):
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(num_classes, num_super_classes, hidden_size, class_dropout_prob)
+        # If precomputed CLIP taxonomy tables are supplied, condition on them (ClipEmbedder);
+        # otherwise fall back to the original learned lookup table (LabelEmbedder).
+        self.use_clip_embedder = clip_species is not None
+        if self.use_clip_embedder:
+            self.y_embedder = ClipEmbedder(
+                clip_species, clip_coarse, hidden_size, class_dropout_prob,
+                code_dim=clip_code_dim,
+            )
+        else:
+            self.y_embedder = LabelEmbedder(num_classes, num_super_classes, hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
@@ -292,8 +378,10 @@ class DiT(nn.Module):
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
         nn.init.constant_(self.x_embedder.proj.bias, 0)
 
-        # Initialize label embedding table:
-        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+        # Initialize label embedding table (only for the lookup-table LabelEmbedder;
+        # ClipEmbedder initializes its own trainable params in its constructor):
+        if not getattr(self, "use_clip_embedder", False):
+            nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
 
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
@@ -345,6 +433,19 @@ class DiT(nn.Module):
         x = self.unpatchify(x)  # (N, out_channels, H, W)
         return x
 
+    def _forward_clip_cfg(self, x, t, y, force_drop_ids):
+        """Like forward(), but passes force_drop_ids to the ClipEmbedder so the dropped
+        samples are conditioned on the coarse (Phylum) CLIP null."""
+        x = self.x_embedder(x) + self.pos_embed
+        t = self.t_embedder(t)
+        y = self.y_embedder(y, False, force_drop_ids=force_drop_ids)
+        c = t + y
+        for block in self.blocks:
+            x = block(x, c)
+        x = self.final_layer(x, c)
+        x = self.unpatchify(x)
+        return x
+
     def forward_with_cfg(self, x, t, y, cfg_scale):
         """
         Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
@@ -353,7 +454,17 @@ class DiT(nn.Module):
 
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
+        if getattr(self, "use_clip_embedder", False):
+            # ClipEmbedder path: caller passes plain class labels for BOTH halves (y has the
+            # same layout as x: first half conditional, second half its CFG null). We force
+            # the second half onto the coarse (Phylum) null via force_drop_ids, so the caller
+            # does NOT use the LabelEmbedder superclass-row trick.
+            n = combined.shape[0]
+            force_drop = torch.zeros(n, dtype=torch.long, device=combined.device)
+            force_drop[n // 2:] = 1
+            model_out = self._forward_clip_cfg(combined, t, y, force_drop)
+        else:
+            model_out = self.forward(combined, t, y)
         # For exact reproducibility reasons, we apply classifier-free guidance on only
         # three channels by default. The standard approach to cfg applies it to all channels.
         # This can be done by uncommenting the following line and commenting-out the line following that.
