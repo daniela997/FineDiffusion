@@ -98,7 +98,11 @@ def main() -> None:
             print(f"packing {n_png} images -> {tar} ...")
             # -C so the archive holds "Images/<Class>/<file>.png" paths, matching the layout
             # the training code walks after extraction.
-            subprocess.run(["tar", "cf", tar, "-C", args.src, "Images"], check=True)
+            # --owner/--group 0: do not record this workstation's uid/gid in the archive.
+            # Otherwise extraction on a machine without that uid emits "Cannot change
+            # ownership ... Operation not permitted" for every file and exits non-zero.
+            subprocess.run(["tar", "cf", tar, "--owner=0", "--group=0",
+                            "-C", args.src, "Images"], check=True)
             print(f"  {os.path.getsize(tar)/1e9:.2f} GB, uploading as a single file ...")
             api.upload_file(path_or_fileobj=tar, path_in_repo="Images.tar",
                             repo_id=args.repo, repo_type="dataset")

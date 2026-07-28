@@ -74,7 +74,12 @@ fi
 # in both directions), unpack it into the layout the training code walks.
 if [ -f "$DEST/Images.tar" ] && [ ! -d "$DEST/Images" ]; then
     log "unpacking Images.tar (74181 files; a few minutes on the shared volume)"
-    tar xf "$DEST/Images.tar" -C "$DEST" || { log "UNTAR FAILED"; sleep infinity; }
+    # --no-same-owner: the archive records the uploading workstation's uid/gid (1008), which
+    # the pod cannot chown to. Without this, tar emits "Cannot change ownership ... Operation
+    # not permitted" per file and exits non-zero even though every file extracted fine.
+    # --no-same-permissions likewise defers to the pod's umask instead of the archived mode.
+    tar xf "$DEST/Images.tar" -C "$DEST" --no-same-owner --no-same-permissions \
+        || { log "UNTAR FAILED"; sleep infinity; }
     # Drop the archive only after a successful extract — 2.3GB back, and re-running the
     # script then re-downloads rather than silently finding a half-extracted tree.
     rm -f "$DEST/Images.tar"
