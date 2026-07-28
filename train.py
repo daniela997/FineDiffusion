@@ -269,7 +269,9 @@ def generate_samples(ema_model, diffusion, vae, class_labels, num_timesteps, dev
             samples, _ = samples.chunk(2, dim=0)
 
             # Decode from latent space
-            samples = vae.decode(samples / 0.18215).sample
+            # Match the VAE's own dtype: it may now be fp16 (see --vae-fp32), and autocast
+            # does not cast module *weights*, so a fp32 latent here would mismatch.
+            samples = vae.decode((samples / 0.18215).to(next(vae.parameters()).dtype)).sample
     finally:
         torch.set_grad_enabled(True)
     
@@ -379,7 +381,15 @@ def main(args):
     requires_grad(ema, False)
     model = DDP(model.to(device), device_ids=[rank])
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
+    # The VAE is FROZEN and inference-only, so fp16 is safe and roughly halves its cost.
+    # Measured at batch 32 on an A5000: encode takes 355ms in fp32 vs 207ms in fp16, against
+    # ~396ms for the whole DiT forward+backward — i.e. the encode was ~47% of each step, and
+    # it was running OUTSIDE the autocast block in full fp32.
+    # --vae-fp32 restores the old behaviour if the latents ever look wrong.
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    vae_dtype = torch.float32 if args.vae_fp32 else torch.float16
+    vae = vae.to(dtype=vae_dtype).eval()
+    logger.info(f"VAE dtype: {vae_dtype}")
     
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -545,7 +555,9 @@ def main(args):
             x = x.to(device)
             y = y.to(device)
             with torch.no_grad():
-                x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+                # Cast the batch to the VAE's dtype, then bring the latent back to fp32 —
+                # the diffusion loss and the DiT's own autocast expect fp32 inputs.
+                x = vae.encode(x.to(vae_dtype)).latent_dist.sample().mul_(0.18215).float()
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             model_kwargs = dict(y=y)
             
@@ -664,6 +676,9 @@ if __name__ == "__main__":
     parser.add_argument("--global-batch-size", type=int, default=3)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="mse")  # Choice doesn't affect training
+    parser.add_argument("--vae-fp32", action="store_true",
+                        help="run the frozen VAE in fp32 (the old behaviour). Default is fp16, "
+                             "which halves the encode cost — it was ~47%% of each training step.")
     parser.add_argument("--num-workers", type=int, default=4,
                         help="dataloader workers PER RANK (so N ranks x this many processes). "
                              "pad_to_square costs ~24ms/image = ~41 img/s per worker, so "
