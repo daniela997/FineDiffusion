@@ -28,6 +28,12 @@ CLIP_NPZ="${CLIP_NPZ:-$REPO_DIR/ifcb_rd32_participation_morpho.npz}"
 # if the near-synonymous pairs (Guinardia_delicatula_single vs _single_double, cos 0.993)
 # turn out to generate poorly.
 CLIP_CODE_DIM="${CLIP_CODE_DIM:-0}"
+# GPUs on this pod, and the GLOBAL batch (train.py divides it by world size). 64/2 = 32 per
+# GPU, which is what the 2x24GB workstation runs; 64/4 = 16 per GPU on the A6000 pod. Keeping
+# the global batch fixed keeps the optimisation identical across pod shapes — same effective
+# batch, same steps per epoch — at the cost of sublinear speedup on more GPUs.
+NPROC="${NPROC:-4}"
+GLOBAL_BS="${GLOBAL_BS:-64}"
 
 export IFCB_ANNS="$DATA/anns"
 export PYTHONUNBUFFERED=1
@@ -88,6 +94,11 @@ if [ ! -f "$CLIP_NPZ" ]; then
 fi
 log "conditioning: $CLIP_NPZ (code_dim=$CLIP_CODE_DIM)"
 
+if [ $((GLOBAL_BS % NPROC)) -ne 0 ]; then
+    log "FATAL: GLOBAL_BS=$GLOBAL_BS is not divisible by NPROC=$NPROC. Holding pod open."
+    sleep infinity
+fi
+
 mkdir -p "$RESULTS"
 
 # ---- train ---------------------------------------------------------------------------
@@ -98,8 +109,8 @@ mkdir -p "$RESULTS"
 #
 # global-batch-size 64 is kept from the local 2-GPU runs so the optimisation is unchanged
 # and results stay comparable; it is a GLOBAL size, so it splits 16/GPU across 4.
-log "launching FineDiffusion-CLIP on 4 GPUs (global batch 64)"
-"$VENV/bin/torchrun" --nnodes=1 --nproc_per_node=4 train.py \
+log "launching FineDiffusion-CLIP on $NPROC GPUs (global batch $GLOBAL_BS = $((GLOBAL_BS/NPROC))/GPU)"
+"$VENV/bin/torchrun" --nnodes=1 --nproc_per_node="$NPROC" train.py \
     --model DiT-XL/2 \
     --resume "$DATA/DiT-XL-2-256x256.pt" \
     --data-path "$DATA/Images" \
@@ -109,7 +120,7 @@ log "launching FineDiffusion-CLIP on 4 GPUs (global batch 64)"
     --clip-embeddings "$CLIP_NPZ" \
     --clip-code-dim "$CLIP_CODE_DIM" \
     --epochs 150 \
-    --global-batch-size 64 \
+    --global-batch-size "$GLOBAL_BS" \
     --image-size 256 \
     --results-dir "$RESULTS" \
     --num-workers 2 \
