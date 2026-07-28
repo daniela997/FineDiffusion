@@ -167,6 +167,53 @@ def encode(model, strings, device, batch=128):
     return torch.cat(out).numpy().astype(np.float32)
 
 
+@torch.no_grad()
+def encode_images(model, images_dir, folders, device, batch=256, workers=8):
+    """Per-image LoRA-CLIP embeddings for every training image, plus per-class means.
+
+    Returns (keys, emb, class_mean) where `keys` is a list of "<Folder>/<file>.png" in the
+    same order as `emb` [N, D], and `class_mean` is [C, D] aligned to `folders`.
+
+    Per-image (not just per-class-mean) because the model is trained on each image's OWN
+    embedding: mean-pooling would discard the intra-class variance that distinguishes e.g.
+    Chaetoceros_didymus chains from singles. The mean is stored alongside because sampling
+    has no image to encode, and because training substitutes it for a fraction of samples
+    (see ClipEmbedder's p_mean) so that it is an in-distribution query at generation time.
+    """
+    import torch.utils.data as tud
+    from PIL import Image
+
+    pre = model.preprocess
+    paths, keys = [], []
+    for f in folders:
+        d = os.path.join(images_dir, f)
+        for fn in sorted(os.listdir(d)):
+            if fn.endswith(".png"):
+                paths.append(os.path.join(d, fn))
+                keys.append(f"{f}/{fn}")
+
+    class _DS(tud.Dataset):
+        def __len__(self): return len(paths)
+        def __getitem__(self, i): return pre(Image.open(paths[i]).convert("RGB"))
+
+    dl = tud.DataLoader(_DS(), batch_size=batch, num_workers=workers, pin_memory=True)
+    out = []
+    for i, px in enumerate(dl):
+        f = model.encode_image(px.to(device), project=False).float()
+        out.append((f / f.norm(dim=-1, keepdim=True)).cpu())
+        if i % 20 == 0:
+            print(f"  encoded {min((i + 1) * batch, len(paths))}/{len(paths)}", flush=True)
+    emb = torch.cat(out).numpy().astype(np.float32)
+
+    idx = {f: i for i, f in enumerate(folders)}
+    cls = np.array([idx[k.split("/")[0]] for k in keys])
+    mean = np.zeros((len(folders), emb.shape[1]), dtype=np.float32)
+    for c in range(len(folders)):
+        m = emb[cls == c].mean(0)
+        mean[c] = m / (np.linalg.norm(m) + 1e-8)
+    return keys, emb, mean
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -182,6 +229,12 @@ def main() -> None:
     ap.add_argument("--name", default=None,
                     help="provenance string stored as clip_model (default: the ckpt basename)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--images-embed", action="store_true",
+                    help="also encode every training image with the LoRA IMAGE tower and store "
+                         "per-image embeddings + per-class means (clip_emb_image_* keys). Needed "
+                         "for the text+image conditioning arm; ~10 min on a GPU for 74k images.")
+    ap.add_argument("--embed-batch", type=int, default=256)
+    ap.add_argument("--embed-workers", type=int, default=8)
     ap.add_argument("--dry-run", action="store_true",
                     help="build and print the strings, load no model, write nothing")
     args = ap.parse_args()
@@ -205,14 +258,27 @@ def main() -> None:
 
     if os.path.exists(args.out):
         sys.exit(f"{args.out} exists — refusing to overwrite. Delete it or pick another --out.")
-    np.savez(args.out,
-             folder=np.array(folders, dtype=object),
-             species_string=np.array(species),
-             coarse_string=np.array(coarse),
-             clip_emb_species=emb_s,
-             clip_emb_coarse=emb_c,
-             clip_model=args.name or os.path.basename(args.ckpt).replace(".pt", ""))
-    print(f"wrote {args.out}")
+    tables = dict(
+        folder=np.array(folders, dtype=object),
+        species_string=np.array(species),
+        coarse_string=np.array(coarse),
+        clip_emb_species=emb_s,
+        clip_emb_coarse=emb_c,
+        clip_model=args.name or os.path.basename(args.ckpt).replace(".pt", ""),
+    )
+    if args.images_embed:
+        print(f"encoding images with the LoRA image tower ...")
+        keys, img_emb, img_mean = encode_images(model, args.images, folders, args.device,
+                                                batch=args.embed_batch, workers=args.embed_workers)
+        tables.update(
+            clip_emb_image=img_emb.astype(np.float16),   # [N, D] per-image; fp16 halves the file
+            clip_emb_image_keys=np.array(keys),          # "<Folder>/<file>.png", aligned to rows
+            clip_emb_image_mean=img_mean,                # [C, D] per-class mean, fp32
+        )
+        print(f"  per-image {img_emb.shape} + class-mean {img_mean.shape}")
+
+    np.savez(args.out, **tables)
+    print(f"wrote {args.out} ({os.path.getsize(args.out) / 1e6:.1f} MB)")
 
 
 if __name__ == "__main__":

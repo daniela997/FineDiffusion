@@ -211,7 +211,7 @@ class ClipEmbedder(nn.Module):
     """
 
     def __init__(self, clip_species, clip_coarse, hidden_size, dropout_prob,
-                 code_dim=32, proj_hidden=None):
+                 code_dim=32, proj_hidden=None, clip_image_mean=None, p_mean=0.5):
         super().__init__()
         clip_species = torch.as_tensor(clip_species, dtype=torch.float32)
         clip_coarse = torch.as_tensor(clip_coarse, dtype=torch.float32)
@@ -239,9 +239,31 @@ class ClipEmbedder(nn.Module):
         if self.code is not None:
             nn.init.normal_(self.code.weight, std=0.02)
 
+        # Optional IMAGE conditioning, concatenated with the text vector.
+        #
+        # The model is trained on each image's OWN embedding (passed per-sample to forward),
+        # which captures the intra-class variance a class prototype discards — e.g.
+        # Chaetoceros_didymus chains vs singles, whose lineage strings are near-identical
+        # (cos 0.999) but whose appearance is not.
+        #
+        # At SAMPLING there is no image to encode, so the per-class mean is all that is
+        # available. A mean is not a training sample — in high dimensions the centroid of a
+        # spherical cloud sits far from every point on it — so querying it would be off
+        # distribution. p_mean substitutes the class mean for that fraction of TRAINING
+        # samples, making it an in-distribution query at generation time. Same mechanism as
+        # CFG dropout, applied to a second axis.
+        self.use_image = clip_image_mean is not None
+        self.p_mean = p_mean
+        img_dim = 0
+        if self.use_image:
+            m = torch.as_tensor(clip_image_mean, dtype=torch.float32)
+            assert m.shape[0] == self.num_classes, "image-mean table must cover every class"
+            self.register_buffer("clip_image_mean", m)
+            img_dim = m.shape[1]
+
         proj_hidden = proj_hidden or hidden_size
         self.mlp = nn.Sequential(
-            nn.Linear(clip_dim + code_dim, proj_hidden, bias=True),
+            nn.Linear(clip_dim + code_dim + img_dim, proj_hidden, bias=True),
             nn.SiLU(),
             nn.Linear(proj_hidden, hidden_size, bias=True),
         )
@@ -254,21 +276,40 @@ class ClipEmbedder(nn.Module):
             drop = force_drop_ids == 1
         return drop
 
-    def forward(self, labels, train, force_drop_ids=None):
+    def forward(self, labels, train, force_drop_ids=None, image_emb=None):
+        """`image_emb` (N, img_dim): each sample's own CLIP image embedding. Training passes
+        it from the dataset; sampling omits it and the per-class mean is used instead."""
         labels = labels.long()
         clip_vec = self.clip_species[labels]                 # (N, clip_dim)
         code = self.code(labels) if self.code is not None else None
+
+        img = None
+        if self.use_image:
+            mean = self.clip_image_mean[labels]              # (N, img_dim)
+            if image_emb is None:
+                img = mean                                   # sampling: no image to encode
+            else:
+                img = image_emb.to(mean.dtype)
+                if train and self.p_mean > 0:
+                    # Substitute the class mean for a fraction of samples so the mean is an
+                    # in-distribution query at generation time (see __init__).
+                    sub = (torch.rand(labels.shape[0], device=labels.device) < self.p_mean)
+                    img = torch.where(sub.unsqueeze(1), mean, img)
 
         use_dropout = self.dropout_prob > 0
         if (train and use_dropout) or (force_drop_ids is not None):
             drop = self.token_drop(labels, force_drop_ids).unsqueeze(1)  # (N, 1)
             # Hierarchical null: swap species CLIP -> coarse (Phylum) CLIP, zero the code.
+            # The image half also falls back to the class mean, so the null carries the
+            # class's average appearance but no per-image identity.
             clip_vec = torch.where(drop, self.clip_coarse[labels], clip_vec)
             if code is not None:
                 code = torch.where(drop, torch.zeros_like(code), code)
+            if img is not None:
+                img = torch.where(drop, self.clip_image_mean[labels], img)
 
-        x = clip_vec if code is None else torch.cat([clip_vec, code], dim=1)
-        return self.mlp(x)                                   # (N, hidden_size)
+        parts = [clip_vec] + ([code] if code is not None else []) + ([img] if img is not None else [])
+        return self.mlp(torch.cat(parts, dim=1) if len(parts) > 1 else parts[0])
 
 
 #################################################################################
@@ -342,6 +383,8 @@ class DiT(nn.Module):
             clip_species=None,
             clip_coarse=None,
             clip_code_dim=32,
+            clip_image_mean=None,
+            clip_image_p_mean=0.5,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -359,6 +402,7 @@ class DiT(nn.Module):
             self.y_embedder = ClipEmbedder(
                 clip_species, clip_coarse, hidden_size, class_dropout_prob,
                 code_dim=clip_code_dim,
+                clip_image_mean=clip_image_mean, p_mean=clip_image_p_mean,
             )
         else:
             self.y_embedder = LabelEmbedder(num_classes, num_super_classes, hidden_size, class_dropout_prob)
@@ -427,16 +471,21 @@ class DiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y):
+    def forward(self, x, t, y, image_emb=None):
         """
         Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
+        image_emb: (N, D) optional per-sample CLIP image embedding (ClipEmbedder only).
+            Omit at sampling time; the per-class mean is used instead.
         """
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)  # (N, D)
-        y = self.y_embedder(y, self.training)  # (N, D)
+        if self.use_clip_embedder:
+            y = self.y_embedder(y, self.training, image_emb=image_emb)  # (N, D)
+        else:
+            y = self.y_embedder(y, self.training)  # (N, D)
         c = t + y  # (N, D)
         # print(t.shape)
         # print(y.shape)

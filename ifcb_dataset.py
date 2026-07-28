@@ -16,13 +16,19 @@ class IFCBTrainDataset(Dataset):
     3. Maps classes to superclasses (Phyla) from taxonomy
     """
     
-    def __init__(self, data_path, train_csv_path, records_csv_path, transform=None):
+    def __init__(self, data_path, train_csv_path, records_csv_path, transform=None,
+                 image_embeddings=None):
         """
         Args:
             data_path: Path to root directory containing species subdirectories
             train_csv_path: Path to ifcb_train.csv
             records_csv_path: Path to ifcb_records.csv (for taxonomy)
             transform: torchvision transforms to apply to images
+            image_embeddings: optional path to a .npz holding per-image LoRA-CLIP embeddings
+                (keys clip_emb_image + clip_emb_image_keys, from make_clip_embeddings.py
+                --images-embed). When given, __getitem__ returns (img, class_idx, emb) so the
+                model can condition on each image's OWN embedding rather than a class
+                prototype. Without it the dataset is unchanged and returns (img, class_idx).
         """
         self.data_path = Path(data_path)
         self.transform = transform
@@ -76,6 +82,27 @@ class IFCBTrainDataset(Dataset):
         self.class_names = [self.class_to_folder[i] for i in range(self.num_classes)]
         self.superclass_names = [sc for sc, _ in sorted(self.phylum_to_superclass_id.items(), 
                                                          key=lambda x: x[1])]
+
+        # Optional per-image CLIP embeddings, looked up by "<Folder>/<file>.png".
+        self.image_embeddings = None
+        if image_embeddings is not None:
+            import numpy as np
+            z = np.load(image_embeddings, allow_pickle=True)
+            if "clip_emb_image" not in z:
+                raise ValueError(
+                    f"{image_embeddings} has no clip_emb_image — regenerate it with "
+                    f"make_clip_embeddings.py --images-embed")
+            emb = z["clip_emb_image"]
+            keys = {k: i for i, k in enumerate(map(str, z["clip_emb_image_keys"]))}
+            # Resolve every sample up-front so a missing embedding is a startup error rather
+            # than a KeyError thousands of steps into training.
+            rows = []
+            for img_path, _, folder_name in self.samples:
+                k = f"{folder_name}/{Path(img_path).name}"
+                if k not in keys:
+                    raise ValueError(f"no embedding for {k} in {image_embeddings}")
+                rows.append(keys[k])
+            self.image_embeddings = torch.from_numpy(emb[rows].astype("float32"))
     
     def __len__(self):
         return len(self.samples)
@@ -88,6 +115,8 @@ class IFCBTrainDataset(Dataset):
         if self.transform:
             img = self.transform(img)
         
+        if self.image_embeddings is not None:
+            return img, class_idx, self.image_embeddings[idx]
         return img, class_idx
     
     def get_superclass(self, class_idx):

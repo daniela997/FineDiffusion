@@ -315,11 +315,17 @@ def main(args):
     latent_size = args.image_size // 8
 
     # Optionally condition on precomputed LoRA-CLIP taxonomy embeddings (ClipEmbedder).
-    clip_species = clip_coarse = None
+    clip_species = clip_coarse = clip_image_mean = None
     if args.clip_embeddings:
         z = np.load(args.clip_embeddings, allow_pickle=True)
         clip_species = z["clip_emb_species"]   # (C, clip_dim) full-lineage condition
         clip_coarse = z["clip_emb_coarse"]     # (C, clip_dim) Phylum-truncated CFG null
+        if args.clip_image:
+            if "clip_emb_image_mean" not in z:
+                raise SystemExit(
+                    f"--clip-image needs image embeddings, but {args.clip_embeddings} has none. "
+                    f"Regenerate it with make_clip_embeddings.py --images-embed")
+            clip_image_mean = z["clip_emb_image_mean"]   # (C, img_dim) per-class mean
         assert clip_species.shape[0] == args.num_classes, (
             f"clip table has {clip_species.shape[0]} classes but --num-classes={args.num_classes}")
         logger.info(f"Conditioning on CLIP embeddings from {args.clip_embeddings} "
@@ -332,6 +338,8 @@ def main(args):
         clip_species=clip_species,
         clip_coarse=clip_coarse,
         clip_code_dim=args.clip_code_dim,
+        clip_image_mean=clip_image_mean,
+        clip_image_p_mean=args.clip_image_p_mean,
     )
         # Initialize wandb
     if rank == 0:
@@ -464,7 +472,9 @@ def main(args):
         data_path=args.data_path,
         train_csv_path=os.path.join(anns_dir, "ifcb_train.csv"),
         records_csv_path=os.path.join(anns_dir, "ifcb_records.csv"),
-        transform=transform
+        transform=transform,
+        # Only load per-image embeddings when the model will actually consume them.
+        image_embeddings=args.clip_embeddings if args.clip_image else None,
     )
     
     sampler = DistributedSampler(
@@ -551,7 +561,15 @@ def main(args):
     for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
-        for x, y in loader:
+        for batch in loader:
+            # The dataset yields (img, class) or (img, class, image_emb) — the latter only
+            # when per-image CLIP conditioning is enabled.
+            if len(batch) == 3:
+                x, y, img_emb = batch
+                img_emb = img_emb.to(device)
+            else:
+                x, y = batch
+                img_emb = None
             x = x.to(device)
             y = y.to(device)
             with torch.no_grad():
@@ -559,7 +577,7 @@ def main(args):
                 # the diffusion loss and the DiT's own autocast expect fp32 inputs.
                 x = vae.encode(x.to(vae_dtype)).latent_dist.sample().mul_(0.18215).float()
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
-            model_kwargs = dict(y=y)
+            model_kwargs = dict(y=y) if img_emb is None else dict(y=y, image_emb=img_emb)
             
             with autocast():
                 loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
@@ -692,6 +710,16 @@ if __name__ == "__main__":
                         help="Path to precomputed CLIP taxonomy embeddings .npz "
                              "(keys clip_emb_species, clip_emb_coarse). Enables ClipEmbedder "
                              "conditioning instead of the learned lookup table.")
+    parser.add_argument("--clip-image", action="store_true",
+                        help="also condition on each image's OWN LoRA-CLIP embedding, "
+                             "concatenated with the text vector (needs a .npz built with "
+                             "make_clip_embeddings.py --images-embed). Captures the "
+                             "intra-class variance a class prototype discards.")
+    parser.add_argument("--clip-image-p-mean", type=float, default=0.5,
+                        help="fraction of TRAINING samples whose image embedding is replaced by "
+                             "their class mean. Sampling has no image to encode, so the mean is "
+                             "all that is available there; this makes it an in-distribution "
+                             "query instead of an unseen centroid. 0 disables the substitution.")
     parser.add_argument("--clip-code-dim", type=int, default=32,
                         help="Dim of the trainable per-class hybrid code in ClipEmbedder. "
                              "0 = PURE CLIP conditioning (no code), which is the right setting "
