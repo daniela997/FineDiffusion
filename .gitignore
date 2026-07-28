@@ -6,6 +6,7 @@ diffusion/__pycache__
 # them). Regenerate with scripts/make_clip_embeddings.py from a LoRA-CLIP checkpoint.
 *.npz
 !ifcb_rd32_hierarchical_embeddings.npz
+!ifcb_rd32_morpho_fixed.npz
 *.pdf
 *.pt
 *.pth

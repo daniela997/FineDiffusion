@@ -224,9 +224,20 @@ class ClipEmbedder(nn.Module):
         self.register_buffer("clip_coarse", clip_coarse)
 
         # Trainable per-class code (hybrid tie-breaker). Zeroed for the null.
-        self.code = nn.Embedding(self.num_classes, code_dim)
-        nn.init.normal_(self.code.weight, std=0.02)
+        #
+        # code_dim=0 disables it entirely -> PURE CLIP conditioning. That is the scientifically
+        # clean setting for comparing text encoders: the code is a free per-class lookup table,
+        # i.e. exactly what CLIP conditioning is meant to replace, and with only 145 classes
+        # even 32 dims is ample capacity to encode identity directly and route around CLIP.
+        # If that happens, an encoder ablation (rd32 vs e0c vs plain) comes out flat because
+        # the model stopped listening to the embeddings, not because the encoders don't differ.
+        # It is safe to disable only when the conditioning strings are unique per class — use
+        # embeddings built with `make_clip_embeddings.py --morpho` (145/145 unique); the plain
+        # lineage collides for 36 of 145 classes, which the code would otherwise paper over.
         self.code_dim = code_dim
+        self.code = nn.Embedding(self.num_classes, code_dim) if code_dim > 0 else None
+        if self.code is not None:
+            nn.init.normal_(self.code.weight, std=0.02)
 
         proj_hidden = proj_hidden or hidden_size
         self.mlp = nn.Sequential(
@@ -246,16 +257,18 @@ class ClipEmbedder(nn.Module):
     def forward(self, labels, train, force_drop_ids=None):
         labels = labels.long()
         clip_vec = self.clip_species[labels]                 # (N, clip_dim)
-        code = self.code(labels)                             # (N, code_dim)
+        code = self.code(labels) if self.code is not None else None
 
         use_dropout = self.dropout_prob > 0
         if (train and use_dropout) or (force_drop_ids is not None):
             drop = self.token_drop(labels, force_drop_ids).unsqueeze(1)  # (N, 1)
             # Hierarchical null: swap species CLIP -> coarse (Phylum) CLIP, zero the code.
             clip_vec = torch.where(drop, self.clip_coarse[labels], clip_vec)
-            code = torch.where(drop, torch.zeros_like(code), code)
+            if code is not None:
+                code = torch.where(drop, torch.zeros_like(code), code)
 
-        return self.mlp(torch.cat([clip_vec, code], dim=1))  # (N, hidden_size)
+        x = clip_vec if code is None else torch.cat([clip_vec, code], dim=1)
+        return self.mlp(x)                                   # (N, hidden_size)
 
 
 #################################################################################

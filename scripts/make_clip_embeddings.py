@@ -36,7 +36,7 @@ import torch
 RANKS = ["Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "species"]
 
 
-def build_strings(records_csv: str, images_dir: str):
+def build_strings(records_csv: str, images_dir: str, morpho: bool = False):
     """Per-class (folder, species_string, coarse_string), ordered by folder name.
 
     Order matters: it must match the class indices `train.py` derives from
@@ -61,8 +61,73 @@ def build_strings(records_csv: str, images_dir: str):
         # entirely empty lineage. Fall back to the folder name, as the original embeddings
         # did — an empty string would encode all four to the same meaningless vector and
         # make them mutually indistinguishable as conditions.
-        rows.append((f, " ".join(parts) or f, " ".join(coarse) or f))
+        # A class with NO lineage at all already falls back to its folder name, which is
+        # fully distinguishing — appending a suffix would just repeat one of its own tokens
+        # ("Faecal_pellet pellet"), so morpho only applies to real lineages.
+        species = " ".join(parts)
+        if morpho and species:
+            species = _append_morpho(species, f)
+        species = species or f
+        rows.append((f, species, " ".join(coarse) or f))
     return rows
+
+
+def _append_morpho(lineage: str, folder: str) -> str:
+    """Append the folder's distinguishing suffix to the lineage string.
+
+    25% of IFCB classes (36/145) share a lineage string with another class, so on the plain
+    lineage their CLIP vectors are identical and the classes are literally unconditionable —
+    e.g. Cerautulina_pelagica_chain vs _single_double are visually distinct morphologies with
+    the same taxonomy. The suffix is whatever the folder name carries beyond the taxonomy:
+    tokenise the folder, drop the tokens already present in the lineage, keep the rest.
+
+      Cerautulina_pelagica_chain  -> "... Cerataulina pelagica chain"
+      Chaetoceros_morphotype1     -> "... Chaetoceros morphotype1"
+      Flagellate_clump            -> "Protozoa Flagellates clump"
+
+    Matching by token (not by prefix length) is what makes the Flagellates work: their
+    lineage stops at Phylum, so there is no species token to strip, yet "Flagellate" is
+    already represented by "Flagellates".
+
+    A folder token is dropped when it is *near* a lineage token, not only when equal: the
+    source data spells the same taxon differently in the folder and the records CSV
+    (Cerautulina/Cerataulina, Dinobyron/Dinobryon, Eutriptiella/Eutreptiella, Asterompalus/
+    Asteromphalus). Appending those would duplicate the genus as if it were a morphotype,
+    so they are treated as redundant rather than distinguishing.
+    """
+    have = {t.lower() for t in lineage.replace("-", " ").split()}
+    extra = []
+    for tok in folder.replace("-", "_").split("_"):
+        t = tok.lower()
+        if not t or t in have:
+            continue
+        if any(_near(t, h) for h in have):
+            continue
+        extra.append(tok)
+    return " ".join([lineage, *extra]) if extra else lineage
+
+
+def _near(a: str, b: str) -> bool:
+    """True when two tokens denote the same taxon despite differing spelling.
+
+    Prefix relation (Flagellate/Flagellates, pellet/pellets) or a small edit distance on
+    long tokens (Cerautulina/Cerataulina). Deliberately conservative: real morphotype
+    markers ('chain', 'single', 'clump', 'morphotype1') are short and share no stem with
+    any lineage token, so they survive.
+    """
+    if len(a) >= 5 and len(b) >= 5 and (a.startswith(b) or b.startswith(a)):
+        return True
+    if len(a) < 6 or len(b) < 6 or abs(len(a) - len(b)) > 2:
+        return False
+    # Levenshtein, capped — same-length-ish long tokens differing by <=2 edits are the
+    # misspelling case, not a distinct morphotype.
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1] <= 2
 
 
 def load_encoder(ckpt_path: str, device: str):
@@ -109,6 +174,11 @@ def main() -> None:
     ap.add_argument("--records", default="/scratch/datasets/other/IFCB_FishNet_Format/anns/ifcb_records.csv")
     ap.add_argument("--images", default="/scratch/datasets/other/IFCB_FishNet_Format/Images")
     ap.add_argument("--out", required=True, help="output .npz")
+    ap.add_argument("--morpho", action="store_true",
+                    help="append each folder's distinguishing suffix to the lineage string "
+                         "(e.g. '... Cerataulina pelagica chain'). Without it, 36 of 145 "
+                         "classes share a string with another class and are indistinguishable "
+                         "as conditions. Use this unless you specifically want plain lineages.")
     ap.add_argument("--name", default=None,
                     help="provenance string stored as clip_model (default: the ckpt basename)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -116,7 +186,7 @@ def main() -> None:
                     help="build and print the strings, load no model, write nothing")
     args = ap.parse_args()
 
-    rows = build_strings(args.records, args.images)
+    rows = build_strings(args.records, args.images, morpho=args.morpho)
     folders = [r[0] for r in rows]
     species = [r[1] for r in rows]
     coarse = [r[2] for r in rows]
