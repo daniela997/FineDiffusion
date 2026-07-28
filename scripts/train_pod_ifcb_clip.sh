@@ -14,9 +14,19 @@ DATA=/mnt/datasets/ifcb_finediffusion
 VENV=/root/fd-venv
 PY="$VENV/bin/python"
 RESULTS=/mnt/resources/finediffusion_clip_results
-# The conditioning embeddings. Generate with scripts/make_clip_embeddings.py from the
-# planktonzilla LoRA checkpoint; override by exporting CLIP_NPZ before running this script.
-CLIP_NPZ="${CLIP_NPZ:-$REPO_DIR/ifcb_rd32_hierarchical_embeddings.npz}"
+# Conditioning embeddings: ranked-dedup r=32 + participation level weighting (sweep xaj57jjj
+# run 55xwqbpe, eval/seen/species_f1 0.7142 — above the whole uniform arm). Built with
+# --morpho, so all 145 conditioning strings are unique. Override by exporting CLIP_NPZ.
+# Swap to ifcb_rd32_morpho_fixed.npz for the uniform-encoder arm: identical strings, so the
+# only variable is the encoder.
+CLIP_NPZ="${CLIP_NPZ:-$REPO_DIR/ifcb_rd32_participation_morpho.npz}"
+# 0 = PURE CLIP conditioning: no trainable per-class code. The code is a free per-class
+# lookup table — what CLIP conditioning is meant to replace — and with 145 classes even 32
+# dims can encode identity directly and route around CLIP, flattening an encoder ablation
+# for the wrong reason. Safe at 0 only because --morpho makes every string unique; set 8-16
+# if the near-synonymous pairs (Guinardia_delicatula_single vs _single_double, cos 0.993)
+# turn out to generate poorly.
+CLIP_CODE_DIM="${CLIP_CODE_DIM:-0}"
 
 export IFCB_ANNS="$DATA/anns"
 export PYTHONUNBUFFERED=1
@@ -75,7 +85,7 @@ if [ ! -f "$CLIP_NPZ" ]; then
     log "  then re-run with CLIP_NPZ=<out.npz>. Holding pod open."
     sleep infinity
 fi
-log "conditioning: $CLIP_NPZ"
+log "conditioning: $CLIP_NPZ (code_dim=$CLIP_CODE_DIM)"
 
 mkdir -p "$RESULTS"
 
@@ -96,7 +106,7 @@ log "launching FineDiffusion-CLIP on 4 GPUs (global batch 64)"
     --num-classes 145 \
     --num-super-classes 12 \
     --clip-embeddings "$CLIP_NPZ" \
-    --clip-code-dim 32 \
+    --clip-code-dim "$CLIP_CODE_DIM" \
     --epochs 150 \
     --global-batch-size 64 \
     --image-size 256 \

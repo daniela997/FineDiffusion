@@ -665,6 +665,13 @@ if __name__ == "__main__":
                              "(keys clip_emb_species, clip_emb_coarse). Enables ClipEmbedder "
                              "conditioning instead of the learned lookup table.")
     parser.add_argument("--clip-code-dim", type=int, default=32,
-                        help="Dim of the trainable per-class hybrid code in ClipEmbedder.")
+                        help="Dim of the trainable per-class hybrid code in ClipEmbedder. "
+                             "0 = PURE CLIP conditioning (no code), which is the right setting "
+                             "for comparing text encoders: the code is a free per-class lookup "
+                             "table, and with 145 classes even 32 dims can encode identity "
+                             "directly and route around CLIP, flattening the ablation for the "
+                             "wrong reason. Only safe at 0 when every conditioning string is "
+                             "unique — use embeddings built with make_clip_embeddings.py "
+                             "--morpho (the plain lineage collides for 36 of 145 classes).")
     args = parser.parse_args()
     main(args)
