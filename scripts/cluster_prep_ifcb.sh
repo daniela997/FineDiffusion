@@ -86,6 +86,16 @@ if [ -f "$DEST/Images.tar" ] && [ ! -d "$DEST/Images" ]; then
     log "unpacked; removed the archive"
 fi
 
+# ---- per-image conditioning embeddings (100MB; only needed for the text+image arm) ----
+# Too large to track in git, so it lives in the dataset repo alongside the images.
+# snapshot_download above already pulls it if present; this is the explicit check.
+if [ -f "$DEST/ifcb_rd32_participation_morpho_img.npz" ]; then
+    log "per-image embeddings present ($(du -h "$DEST/ifcb_rd32_participation_morpho_img.npz" | cut -f1))"
+else
+    log "NOTE: no per-image embeddings in the repo — the text+image arm will not run"
+    log "      (the text-only arm is unaffected; its npz ships in the git repo)"
+fi
+
 # ---- pretrained DiT-XL/2 checkpoint (2.7GB, public, straight from FAIR) -------------
 if [ -f "$DEST/DiT-XL-2-256x256.pt" ]; then
     log "DiT checkpoint already present — skipping"

@@ -28,6 +28,12 @@ CLIP_NPZ="${CLIP_NPZ:-$REPO_DIR/ifcb_rd32_participation_morpho.npz}"
 # if the near-synonymous pairs (Guinardia_delicatula_single vs _single_double, cos 0.993)
 # turn out to generate poorly.
 CLIP_CODE_DIM="${CLIP_CODE_DIM:-0}"
+# Text+image arm: set CLIP_IMAGE=1 and point CLIP_NPZ at an npz built with --images-embed
+# (staged to $DATA by the prep script, since it is 100MB and not in git). P_MEAN is the
+# fraction of training samples whose image embedding is swapped for their class mean, so
+# that the mean — all that is available at sampling time — is an in-distribution query.
+CLIP_IMAGE="${CLIP_IMAGE:-0}"
+P_MEAN="${P_MEAN:-0.5}"
 # GPUs on this pod, and the GLOBAL batch (train.py divides it by world size). 64/2 = 32 per
 # GPU, which is what the 2x24GB workstation runs; 64/4 = 16 per GPU on the A6000 pod. Keeping
 # the global batch fixed keeps the optimisation identical across pod shapes — same effective
@@ -105,7 +111,14 @@ if [ ! -f "$CLIP_NPZ" ]; then
     log "  then re-run with CLIP_NPZ=<out.npz>. Holding pod open."
     sleep infinity
 fi
-log "conditioning: $CLIP_NPZ (code_dim=$CLIP_CODE_DIM)"
+IMAGE_FLAGS=""
+if [ "$CLIP_IMAGE" = "1" ]; then
+    IMAGE_FLAGS="--clip-image --clip-image-p-mean $P_MEAN"
+    log "conditioning: TEXT + PER-IMAGE, p_mean=$P_MEAN"
+else
+    log "conditioning: TEXT only"
+fi
+log "  npz: $CLIP_NPZ (code_dim=$CLIP_CODE_DIM)"
 
 if [ $((GLOBAL_BS % NPROC)) -ne 0 ]; then
     log "FATAL: GLOBAL_BS=$GLOBAL_BS is not divisible by NPROC=$NPROC. Holding pod open."
@@ -136,6 +149,7 @@ fi
     --num-super-classes 12 \
     --clip-embeddings "$CLIP_NPZ" \
     --clip-code-dim "$CLIP_CODE_DIM" \
+    $IMAGE_FLAGS \
     --epochs 150 \
     --global-batch-size "$GLOBAL_BS" \
     --image-size 256 \
