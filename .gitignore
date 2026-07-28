@@ -7,6 +7,7 @@ diffusion/__pycache__
 *.npz
 !ifcb_rd32_hierarchical_embeddings.npz
 !ifcb_rd32_morpho_fixed.npz
+!ifcb_rd32_participation_morpho.npz
 *.pdf
 *.pt
 *.pth
