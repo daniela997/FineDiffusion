@@ -111,6 +111,19 @@ if [ ! -f "$CLIP_NPZ" ]; then
     log "  then re-run with CLIP_NPZ=<out.npz>. Holding pod open."
     sleep infinity
 fi
+# The per-image npz is 100MB and NOT in git, so prep stages it to $DATA (shared). If it is
+# missing on THIS pod, fetch it with the TRAINING venv. Do not reach for a venv built on
+# another pod: /root is LOCAL disk, so /root/prep-venv does not exist here, and referencing
+# it made the script fail its guard before torchrun ever ran (no process, no results dir,
+# GPUs never touched).
+if [ "$CLIP_IMAGE" = "1" ] && [ ! -f "$CLIP_NPZ" ]; then
+    log "per-image npz missing at $CLIP_NPZ - fetching from the HF dataset repo"
+    VIRTUAL_ENV="$VENV" uv pip install -q huggingface_hub 2>/dev/null
+    NPZ_BASE=$(basename "$CLIP_NPZ")
+    "$PY" -c "import shutil,sys; from huggingface_hub import hf_hub_download; shutil.copy(hf_hub_download('danielaivanova/ifcb-finediffusion', sys.argv[1], repo_type='dataset'), sys.argv[2]); print('staged', sys.argv[2])" "$NPZ_BASE" "$CLIP_NPZ"
+    [ -f "$CLIP_NPZ" ] || { log "FETCH FAILED - set HF_TOKEN, or stage $CLIP_NPZ manually."; sleep infinity; }
+fi
+
 IMAGE_FLAGS=""
 if [ "$CLIP_IMAGE" = "1" ]; then
     IMAGE_FLAGS="--clip-image --clip-image-p-mean $P_MEAN"
