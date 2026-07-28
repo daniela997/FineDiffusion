@@ -17,8 +17,9 @@ RESULTS=/mnt/resources/finediffusion_clip_results
 # Conditioning embeddings: ranked-dedup r=32 + participation level weighting (sweep xaj57jjj
 # run 55xwqbpe, eval/seen/species_f1 0.7142 — above the whole uniform arm). Built with
 # --morpho, so all 145 conditioning strings are unique. Override by exporting CLIP_NPZ.
-# Swap to ifcb_rd32_morpho_fixed.npz for the uniform-encoder arm: identical strings, so the
-# only variable is the encoder.
+# The uniform-encoder arm (ifcb_rd32_morpho_fixed.npz — identical strings, only the encoder
+# differs) is NOT tracked; regenerate it with make_clip_embeddings.py --morpho from the
+# daiqxa8h checkpoint if that comparison is wanted again.
 CLIP_NPZ="${CLIP_NPZ:-$REPO_DIR/ifcb_rd32_participation_morpho.npz}"
 # 0 = PURE CLIP conditioning: no trainable per-class code. The code is a free per-class
 # lookup table — what CLIP conditioning is meant to replace — and with 145 classes even 32
