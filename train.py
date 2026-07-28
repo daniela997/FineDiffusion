@@ -445,10 +445,15 @@ def main(args):
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
     
+    # Annotation CSVs live next to the images. Default to the local workstation layout, but
+    # allow IFCB_ANNS (or --anns-dir) to relocate the whole set — on the cluster the data sits
+    # on a shared volume (/mnt/datasets/...), so hardcoded /scratch paths don't exist there.
+    anns_dir = args.anns_dir or os.environ.get(
+        "IFCB_ANNS", "/scratch/datasets/other/IFCB_FishNet_Format/anns")
     dataset = IFCBTrainDataset(
         data_path=args.data_path,
-        train_csv_path="/scratch/datasets/other/IFCB_FishNet_Format/anns/ifcb_train.csv",
-        records_csv_path="/scratch/datasets/other/IFCB_FishNet_Format/anns/ifcb_records.csv",
+        train_csv_path=os.path.join(anns_dir, "ifcb_train.csv"),
+        records_csv_path=os.path.join(anns_dir, "ifcb_records.csv"),
         transform=transform
     )
     
@@ -639,6 +644,10 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Training checkpoint to resume from (overrides resume)")
     parser.add_argument("--data-path", type=str, default="datasets/train_mini")
+    parser.add_argument("--anns-dir", type=str, default=None,
+                        help="directory holding ifcb_train.csv / ifcb_records.csv. Defaults to "
+                             "$IFCB_ANNS, else the local /scratch layout. Set this on the cluster, "
+                             "where the data lives on a shared volume.")
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
