@@ -34,6 +34,13 @@ CLIP_CODE_DIM="${CLIP_CODE_DIM:-0}"
 # batch, same steps per epoch — at the cost of sublinear speedup on more GPUs.
 NPROC="${NPROC:-4}"
 GLOBAL_BS="${GLOBAL_BS:-64}"
+# Dataloader workers PER RANK, so the total is NUM_WORKERS x NPROC. pad_to_square costs
+# ~24ms/image (BICUBIC resize + edge-strip tiling + per-pixel shuffle of the padding), so
+# one worker sustains only ~41 img/s. At 32/GPU x 2 GPUs, 3 steps/s needs ~192 img/s ≈ 5
+# workers; 4 per rank (8 total on an 8-CPU pod) leaves headroom without oversubscribing.
+# Default sized for the 8-CPU pods: NUM_WORKERS x NPROC should be <= CPU count.
+NUM_WORKERS="${NUM_WORKERS:-4}"
+PREFETCH="${PREFETCH:-6}"
 
 export IFCB_ANNS="$DATA/anns"
 export PYTHONUNBUFFERED=1
@@ -110,6 +117,10 @@ mkdir -p "$RESULTS"
 # global-batch-size 64 is kept from the local 2-GPU runs so the optimisation is unchanged
 # and results stay comparable; it is a GLOBAL size, so it splits 16/GPU across 4.
 log "launching FineDiffusion-CLIP on $NPROC GPUs (global batch $GLOBAL_BS = $((GLOBAL_BS/NPROC))/GPU)"
+log "  dataloader: $NUM_WORKERS workers/rank x $NPROC = $((NUM_WORKERS*NPROC)) procs (pod has $(nproc) CPUs)"
+if [ $((NUM_WORKERS*NPROC)) -gt "$(nproc)" ]; then
+    log "  WARNING: more workers than CPUs — they will contend. Lower NUM_WORKERS."
+fi
 "$VENV/bin/torchrun" --nnodes=1 --nproc_per_node="$NPROC" train.py \
     --model DiT-XL/2 \
     --resume "$DATA/DiT-XL-2-256x256.pt" \
@@ -123,7 +134,8 @@ log "launching FineDiffusion-CLIP on $NPROC GPUs (global batch $GLOBAL_BS = $((G
     --global-batch-size "$GLOBAL_BS" \
     --image-size 256 \
     --results-dir "$RESULTS" \
-    --num-workers 2 \
+    --num-workers "$NUM_WORKERS" \
+    --prefetch-factor "$PREFETCH" \
     --log-every 500 \
     --ckpt-every 5000
 rc=$?

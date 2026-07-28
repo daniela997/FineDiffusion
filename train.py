@@ -471,7 +471,14 @@ def main(args):
         sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=True,
-        drop_last=True
+        drop_last=True,
+        # Rebuilding worker processes every epoch is pure overhead here: an epoch is only
+        # ~900 steps, and each respawn re-imports torch and re-opens the CSVs.
+        persistent_workers=args.num_workers > 0,
+        # The transform (pad_to_square: BICUBIC resize + edge-strip tiling + a per-pixel
+        # shuffle of the padding) costs ~24ms/image, so a worker sustains only ~41 img/s.
+        # Queue several batches ahead so a slow worker does not stall the step.
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
     )
     # Automatic Mixed Precision
     scaler = GradScaler()
@@ -657,7 +664,13 @@ if __name__ == "__main__":
     parser.add_argument("--global-batch-size", type=int, default=3)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="mse")  # Choice doesn't affect training
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=4,
+                        help="dataloader workers PER RANK (so N ranks x this many processes). "
+                             "pad_to_square costs ~24ms/image = ~41 img/s per worker, so "
+                             "sustaining S steps/s at B per GPU over N GPUs needs about "
+                             "S*B*N/41 workers in total.")
+    parser.add_argument("--prefetch-factor", type=int, default=4,
+                        help="batches each worker queues ahead (torch default 2).")
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=5000)
     parser.add_argument("--clip-embeddings", type=str, default=None,
