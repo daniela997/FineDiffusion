@@ -6,6 +6,10 @@ diffusion/__pycache__
 # Regenerate any of the others with scripts/make_clip_embeddings.py from a LoRA-CLIP ckpt.
 *.npz
 !ifcb_rd32_participation_morpho.npz
+# NOT tracked: ifcb_rd32_participation_morpho_img.npz is 100MB (74181 per-image embeddings).
+# Regenerate with:
+#   scripts/make_clip_embeddings.py --ckpt <lora.pt> --morpho --images-embed \
+#       --out ifcb_rd32_participation_morpho_img.npz
 *.pdf
 *.pt
 *.pth
