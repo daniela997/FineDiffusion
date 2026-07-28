@@ -34,6 +34,13 @@ def main() -> None:
     ap.add_argument("--repo", default=DEFAULT_REPO, help="Hub dataset repo (default: %(default)s)")
     ap.add_argument("--public", action="store_true",
                     help="create the repo public. Default is PRIVATE — IFCB is third-party data.")
+    ap.add_argument("--tar", action="store_true",
+                    help="upload Images/ as ONE tar instead of 74181 individual files. Much "
+                         "faster both ways: upload_folder batches every file into a single "
+                         "atomic commit, so nothing appears on the Hub until all of them "
+                         "finish (no visible progress, and a failure loses the lot), and the "
+                         "pod would then have to fetch 74181 files one by one. "
+                         "cluster_prep_ifcb.sh untars it automatically.")
     ap.add_argument("--dry-run", action="store_true", help="report what would upload, then stop")
     args = ap.parse_args()
 
@@ -83,9 +90,22 @@ def main() -> None:
     print("\nuploading anns/ ...")
     api.upload_folder(folder_path=anns, path_in_repo="anns",
                       repo_id=args.repo, repo_type="dataset")
-    print("uploading Images/ (2.3GB, this is the slow part) ...")
-    api.upload_folder(folder_path=images, path_in_repo="Images",
-                      repo_id=args.repo, repo_type="dataset")
+    if args.tar:
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory(dir=os.path.dirname(args.src)) as td:
+            tar = os.path.join(td, "Images.tar")
+            print(f"packing {n_png} images -> {tar} ...")
+            # -C so the archive holds "Images/<Class>/<file>.png" paths, matching the layout
+            # the training code walks after extraction.
+            subprocess.run(["tar", "cf", tar, "-C", args.src, "Images"], check=True)
+            print(f"  {os.path.getsize(tar)/1e9:.2f} GB, uploading as a single file ...")
+            api.upload_file(path_or_fileobj=tar, path_in_repo="Images.tar",
+                            repo_id=args.repo, repo_type="dataset")
+    else:
+        print("uploading Images/ (2.3GB as 74181 separate files — slow; consider --tar) ...")
+        api.upload_folder(folder_path=images, path_in_repo="Images",
+                          repo_id=args.repo, repo_type="dataset")
     print(f"\ndone: https://huggingface.co/datasets/{args.repo}")
 
 

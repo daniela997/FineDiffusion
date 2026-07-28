@@ -70,6 +70,14 @@ PYEOF
     [ -f "$DEST/anns/ifcb_train.csv" ] || { log "DOWNLOAD INCOMPLETE — no anns/ifcb_train.csv"; sleep infinity; }
 fi
 
+# If the repo holds Images.tar (the --tar upload path: 1 file instead of 74181, far faster
+# in both directions), unpack it into the layout the training code walks.
+if [ -f "$DEST/Images.tar" ] && [ ! -d "$DEST/Images" ]; then
+    log "unpacking Images.tar"
+    tar xf "$DEST/Images.tar" -C "$DEST" || { log "UNTAR FAILED"; sleep infinity; }
+    rm -f "$DEST/Images.tar"
+fi
+
 # ---- pretrained DiT-XL/2 checkpoint (2.7GB, public, straight from FAIR) -------------
 if [ -f "$DEST/DiT-XL-2-256x256.pt" ]; then
     log "DiT checkpoint already present — skipping"
