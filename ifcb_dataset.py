@@ -31,8 +31,16 @@ class IFCBTrainDataset(Dataset):
         self.train_df = pd.read_csv(train_csv_path)
         self.records_df = pd.read_csv(records_csv_path)
         
-        # Get set of training image filenames
-        self.train_image_names = set(self.train_df['image'].values)
+        # Key the training split on (Folder, image), NOT on the filename alone.
+        # IFCB filenames encode instrument + timestamp (D20240312T135943_IFCB191_00092.png)
+        # and are NOT unique across classes: 23 names appear in both ifcb_train.csv and
+        # ifcb_test.csv under different folders, and 35 are duplicated within train itself.
+        # Matching on the name alone therefore pulled 23 genuine TEST images into training,
+        # each labelled with whatever folder it physically sits in (e.g. Detritus/...00092.png
+        # was included because a different image of that name is a training image under
+        # Meuniera_membranacea_single). Keying on the pair yields exactly the 59344 rows in
+        # ifcb_train.csv.
+        self.train_keys = set(zip(self.train_df['Folder'], self.train_df['image']))
         
         # Create superclass mapping from Phylum
         unique_phyla = sorted(self.records_df['Phylum'].dropna().unique())
@@ -57,7 +65,7 @@ class IFCBTrainDataset(Dataset):
                 self.class_to_folder[class_idx] = folder.name
                 
                 for img_path in folder.glob('*.png'):
-                    if img_path.name in self.train_image_names:
+                    if (folder.name, img_path.name) in self.train_keys:
                         self.samples.append((str(img_path), class_idx, folder.name))
                 
                 class_idx += 1
