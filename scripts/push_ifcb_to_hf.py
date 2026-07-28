@@ -22,7 +22,9 @@ import os
 import sys
 
 DEFAULT_SRC = "/scratch/datasets/other/IFCB_FishNet_Format"
-DEFAULT_REPO = "daniela997/ifcb-finediffusion"
+# NOTE: the HF username is `danielaivanova` — `daniela997` is the GitHub handle. Creating
+# under the wrong namespace fails with a 403 that reads like a token-permissions problem.
+DEFAULT_REPO = "danielaivanova/ifcb-finediffusion"
 
 
 def main() -> None:
@@ -56,6 +58,25 @@ def main() -> None:
     from huggingface_hub import HfApi
 
     api = HfApi()
+    # Check identity up-front: a namespace mismatch surfaces as a 403 from create_repo that
+    # looks like a token-scope problem, which sends you to the wrong place.
+    try:
+        me = api.whoami()
+    except Exception as e:
+        sys.exit(f"not logged in to HF ({type(e).__name__}). Run `huggingface-cli login` "
+                 f"or set HF_TOKEN, with a token that has WRITE access.")
+    user = me.get("name")
+    orgs = [o.get("name") for o in (me.get("orgs") or [])]
+    ns = args.repo.split("/")[0]
+    if ns != user and ns not in orgs:
+        sys.exit(f"repo namespace {ns!r} is neither your username ({user!r}) nor one of your "
+                 f"orgs ({orgs}). Pass --repo {user}/<name>.")
+    role = ((me.get("auth") or {}).get("accessToken") or {}).get("role")
+    if role not in (None, "write", "admin"):
+        print(f"  WARNING: token role is {role!r} — if this is a fine-grained token it needs "
+              f"explicit WRITE access to your namespace, or create_repo will 403.")
+    print(f"authenticated as {user}")
+
     api.create_repo(args.repo, repo_type="dataset", private=not args.public, exist_ok=True)
     # Two calls so a failure part-way leaves a diagnosable state (anns are tiny and go first,
     # so a broken run is obvious from the repo contents rather than silently half-populated).

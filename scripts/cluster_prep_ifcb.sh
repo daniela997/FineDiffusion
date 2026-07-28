@@ -13,7 +13,7 @@
 set -u
 
 DEST=/mnt/datasets/ifcb_finediffusion       # <- where training pods will read from
-HF_REPO=daniela997/ifcb-finediffusion       # the dataset repo pushed by scripts/push_ifcb_to_hf.py
+HF_REPO=danielaivanova/ifcb-finediffusion       # the dataset repo pushed by scripts/push_ifcb_to_hf.py
 DIT_CKPT_URL=https://dl.fbaipublicfiles.com/DiT/models/DiT-XL-2-256x256.pt
 VENV=/root/prep-venv
 PY="$VENV/bin/python"
