@@ -1,7 +1,11 @@
 __pycache__/
 diffusion/__pycache__
 # Large binary artifacts (regenerable / reference docs)
+# EXCEPT the conditioning embeddings the training scripts need: they are ~680KB each and
+# must travel with the code (the cluster pods clone the repo and have no other route to
+# them). Regenerate with scripts/make_clip_embeddings.py from a LoRA-CLIP checkpoint.
 *.npz
+!ifcb_rd32_hierarchical_embeddings.npz
 *.pdf
 *.pt
 *.pth
