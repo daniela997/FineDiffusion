@@ -17,6 +17,7 @@ import argparse
 import random
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 import torchvision
@@ -36,25 +37,55 @@ def setup_logging():
     )
 
 
-def load_models(ckpt_path, device, num_classes, num_super_classes, image_size, num_sampling_steps):
-    """Load FineDiffusion model and VAE."""
+def load_models(ckpt_path, device, num_classes, num_super_classes, image_size, num_sampling_steps,
+                clip_embeddings=None):
+    """Load FineDiffusion model and VAE.
+
+    Handles BOTH conditioning types. A ClipEmbedder checkpoint carries clip_species/clip_coarse
+    buffers and no y_embedder.embedding_table, so it cannot be loaded into a LabelEmbedder model
+    (and vice versa). The training args are stored in the checkpoint, so the conditioning is
+    detected from there rather than having to be re-specified; --clip-embeddings overrides the
+    recorded npz path if the file has since moved.
+    """
     logging.info("Loading FineDiffusion model...")
-    
-    # Load model
+
+    checkpoint = torch.load(ckpt_path, map_location=lambda storage, loc: storage)
+    state = checkpoint['ema'] if isinstance(checkpoint, dict) and 'ema' in checkpoint else checkpoint
+
+    # Detect the conditioning from the state dict itself (authoritative), falling back to the
+    # recorded args for the npz path and code dim.
+    uses_clip = any(k.startswith('y_embedder.clip_') for k in state)
+    ck_args = checkpoint.get('args') if isinstance(checkpoint, dict) else None
+    clip_species = clip_coarse = None
+    clip_code_dim = 0
+    if uses_clip:
+        npz_path = clip_embeddings or (getattr(ck_args, 'clip_embeddings', None) if ck_args else None)
+        if not npz_path or not os.path.exists(npz_path):
+            raise SystemExit(
+                f"checkpoint is CLIP-conditioned but its embeddings npz was not found "
+                f"({npz_path!r}). Pass --clip-embeddings with the .npz used for training.")
+        z = np.load(npz_path, allow_pickle=True)
+        clip_species, clip_coarse = z['clip_emb_species'], z['clip_emb_coarse']
+        # The trainable per-class code's width must match the checkpoint, not the args, so read
+        # it off the saved tensor when present (code_dim=0 means there is no code at all).
+        code_w = state.get('y_embedder.code.weight')
+        clip_code_dim = int(code_w.shape[1]) if code_w is not None else 0
+        logging.info(f"CLIP conditioning: {npz_path} (model={z['clip_model']}, "
+                     f"dim={clip_species.shape[1]}, code_dim={clip_code_dim})")
+    else:
+        logging.info("Label conditioning (learned embedding table)")
+
     latent_size = image_size // 8
     model = DiT_models["DiT-XL/2"](
         input_size=latent_size,
         num_classes=num_classes,
-        num_super_classes=num_super_classes
+        num_super_classes=num_super_classes,
+        clip_species=clip_species,
+        clip_coarse=clip_coarse,
+        clip_code_dim=clip_code_dim,
     ).to(device)
-    
-    # Load checkpoint
-    checkpoint = torch.load(ckpt_path, map_location=lambda storage, loc: storage)
-    if isinstance(checkpoint, dict) and 'ema' in checkpoint:
-        model.load_state_dict(checkpoint['ema'])
-    else:
-        model.load_state_dict(checkpoint)
-    
+
+    model.load_state_dict(state)
     model.eval()
     
     # Load VAE
@@ -122,10 +153,19 @@ def generate_images_for_class(
             z = torch.randn(current_batch_size, 4, latent_size, latent_size, device=device)
             y = torch.tensor([class_idx] * current_batch_size, device=device, dtype=torch.long)
             
-            # Setup classifier-free guidance
+            # Setup classifier-free guidance. With ClipEmbedder the null half is produced
+            # INTERNALLY by forward_with_cfg (it swaps the species CLIP vector for the coarse
+            # Phylum one), so both halves are the plain class labels. Only LabelEmbedder needs
+            # the "superclass row = num_classes + superclass_idx" trick.
             z = torch.cat([z, z], 0)
-            y_super = torch.tensor([superclass_idx + num_classes] * current_batch_size, device=device, dtype=torch.long)
-            y = torch.cat([y, y_super], 0)
+            if getattr(model, "use_clip_embedder", False):
+                y = torch.cat([y, y], 0)
+            else:
+                y_super = torch.tensor([superclass_idx + num_classes] * current_batch_size,
+                                       device=device, dtype=torch.long)
+                y = torch.cat([y, y_super], 0)
+            
+
             
             model_kwargs = dict(y=y, cfg_scale=cfg_scale)
             
@@ -167,6 +207,10 @@ def main():
     parser.add_argument("--cfg_scale", type=float, default=4.0, help="Classifier-free guidance scale")
     parser.add_argument("--shard", type=int, default=0, help="Shard index (0-based)")
     parser.add_argument("--num_shards", type=int, default=1, help="Total number of shards")
+    parser.add_argument("--clip_embeddings", "--clip-embeddings", type=str, default=None,
+                        help="Conditioning .npz for a CLIP-conditioned checkpoint. Only needed "
+                             "if the path recorded in the checkpoint's args has moved; the "
+                             "conditioning type itself is detected from the checkpoint.")
     parser.add_argument("--min_samples", type=int, default=100, help="Only generate for classes with fewer samples than this")
     args = parser.parse_args()
     
@@ -195,9 +239,15 @@ def main():
     model, vae, diffusion = load_models(
         args.ckpt, device, 
         dataset.num_classes, dataset.num_superclasses,
-        256, args.num_sampling_steps
+        256, args.num_sampling_steps,
+        clip_embeddings=args.clip_embeddings,
     )
-    model.y_embedder.set_class_to_superclass_mapping(class_to_superclass_mapping)
+    # ClipEmbedder carries the coarse (Phylum) null in its own clip_coarse table and has no
+    # class->superclass mapping to set.
+    if not getattr(model, "use_clip_embedder", False):
+        model.y_embedder.set_class_to_superclass_mapping(class_to_superclass_mapping)
+    
+
     
     # Load class counts
     train_df = pd.read_csv(args.train_csv)
