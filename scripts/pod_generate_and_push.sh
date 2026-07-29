@@ -101,8 +101,19 @@ gen() {
         pids="$pids $!"
         S=$((S + 1))
     done
-    for p in $pids; do wait "$p"; done
-    log "$label done: $(find "$out" -name '*.png' | wc -l) images"
+    rc=0
+    for p in $pids; do wait "$p" || rc=1; done
+    n=$(find "$out" -name '*.png' 2>/dev/null | wc -l)
+    log "$label done: $n images (shard exit status: $rc)"
+    # A shard that dies immediately leaves an empty output dir; without this the script
+    # would sail on to tar and fail there with a far less useful message.
+    if [ "$rc" -ne 0 ] || [ "$n" -eq 0 ]; then
+        log "shard logs:"
+        for f in /mnt/resources/${label}_${TAG}_shard*.log; do
+            log "  --- $f"; tail -15 "$f" | sed 's/^/      /'
+        done
+        die "$label produced nothing — see the shard logs above"
+    fi
 }
 
 gen generate_synthetic_dataset.py "$DATA/synthetic_$TAG" "" "gen"
