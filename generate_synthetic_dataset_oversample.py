@@ -248,7 +248,7 @@ def main():
         class_to_superclass_mapping[class_idx] = dataset.get_superclass(class_idx)
     
     # Load model
-    model, vae, diffusion = load_models(
+    model, vae, diffusion, _ = load_models(
         args.ckpt, device, 
         dataset.num_classes, dataset.num_superclasses,
         256, args.num_sampling_steps,
