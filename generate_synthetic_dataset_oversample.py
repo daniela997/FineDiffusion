@@ -49,7 +49,10 @@ def load_models(ckpt_path, device, num_classes, num_super_classes, image_size, n
     """
     logging.info("Loading FineDiffusion model...")
 
-    checkpoint = torch.load(ckpt_path, map_location=lambda storage, loc: storage)
+    # weights_only=False: our own checkpoints store `args` as an argparse.Namespace,
+    # which torch>=2.6 rejects under the new weights_only=True default.
+    checkpoint = torch.load(ckpt_path, map_location=lambda storage, loc: storage,
+                            weights_only=False)
     state = checkpoint['ema'] if isinstance(checkpoint, dict) and 'ema' in checkpoint else checkpoint
 
     # Detect the conditioning from the state dict itself (authoritative), falling back to the

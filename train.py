@@ -420,7 +420,10 @@ def main(args):
     # If checkpoint provided, load it to resume training
     if args.checkpoint:
         logger.info(f"Loading training checkpoint from {args.checkpoint}")
-        checkpoint_data = torch.load(args.checkpoint, map_location=lambda storage, loc: storage)
+        # weights_only=False: the checkpoint stores `args` as an argparse.Namespace, which
+        # torch>=2.6 rejects under the new weights_only=True default.
+        checkpoint_data = torch.load(args.checkpoint, map_location=lambda storage, loc: storage,
+                                     weights_only=False)
         
         model.module.load_state_dict(checkpoint_data['model'])
         ema.load_state_dict(checkpoint_data['ema'])
