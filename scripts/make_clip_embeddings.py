@@ -168,8 +168,8 @@ def encode(model, strings, device, batch=128):
 
 
 @torch.no_grad()
-def encode_images(model, images_dir, folders, device, batch=256, workers=8):
-    """Per-image LoRA-CLIP embeddings for every training image, plus per-class means.
+def encode_images(model, images_dir, folders, device, batch=256, workers=8, mean_keys=None):
+    """Per-image LoRA-CLIP embeddings for every image in the library, plus per-class means.
 
     Returns (keys, emb, class_mean) where `keys` is a list of "<Folder>/<file>.png" in the
     same order as `emb` [N, D], and `class_mean` is [C, D] aligned to `folders`.
@@ -179,6 +179,14 @@ def encode_images(model, images_dir, folders, device, batch=256, workers=8):
     Chaetoceros_didymus chains from singles. The mean is stored alongside because sampling
     has no image to encode, and because training substitutes it for a fraction of samples
     (see ClipEmbedder's p_mean) so that it is an in-distribution query at generation time.
+
+    `mean_keys` restricts WHICH images contribute to class_mean, and must be passed the
+    training keys. The per-image table is harmlessly library-wide -- IFCBDataset gathers only
+    the rows its own train-filtered samples need -- but class_mean is different: it is baked
+    into the checkpoint as a buffer (ClipEmbedder.clip_image_mean) and used as the sampling
+    default and CFG null, so averaging over test images would encode held-out data into the
+    generator. That is a real leak, and it bites hardest exactly where it is least visible:
+    a class with 3 images of which 1 is in train gets a "mean" that is 2/3 test data.
     """
     import torch.utils.data as tud
     from PIL import Image
@@ -207,9 +215,30 @@ def encode_images(model, images_dir, folders, device, batch=256, workers=8):
 
     idx = {f: i for i, f in enumerate(folders)}
     cls = np.array([idx[k.split("/")[0]] for k in keys])
+
+    # Only `mean_keys` images may contribute to the class mean (see the docstring). Without a
+    # filter the mean would average held-out images into a buffer that ships in the checkpoint.
+    if mean_keys is None:
+        print("  WARNING: no mean_keys given -- class means will include EVERY image in the "
+              "library, which leaks the test split into the generator's conditioning prior")
+        use = np.ones(len(keys), dtype=bool)
+    else:
+        use = np.array([k in mean_keys for k in keys], dtype=bool)
+        print(f"  class means from {int(use.sum())}/{len(keys)} images (train split only)")
+
     mean = np.zeros((len(folders), emb.shape[1]), dtype=np.float32)
     for c in range(len(folders)):
-        m = emb[cls == c].mean(0)
+        sel = (cls == c) & use
+        if not sel.any():
+            # No training image for this class: fall back to all of its images rather than
+            # emit a zero row, and say so -- a zero conditioning vector is not a valid query.
+            sel = cls == c
+            if sel.any():
+                print(f"  NOTE: {folders[c]} has no image in mean_keys; using all "
+                      f"{int(sel.sum())} of its images for the class mean")
+            else:
+                continue
+        m = emb[sel].mean(0)
         mean[c] = m / (np.linalg.norm(m) + 1e-8)
     return keys, emb, mean
 
@@ -233,6 +262,12 @@ def main() -> None:
                     help="also encode every training image with the LoRA IMAGE tower and store "
                          "per-image embeddings + per-class means (clip_emb_image_* keys). Needed "
                          "for the text+image conditioning arm; ~10 min on a GPU for 74k images.")
+    ap.add_argument("--train-csv",
+                    default="/scratch/datasets/other/IFCB_FishNet_Format/anns/ifcb_train.csv",
+                    help="restricts which images contribute to the per-class MEAN, which is "
+                         "baked into the checkpoint as a buffer and used as the sampling "
+                         "default and CFG null. Averaging test images into it leaks held-out "
+                         "data into the generator. Pass '' to disable the filter (not advised).")
     ap.add_argument("--embed-batch", type=int, default=256)
     ap.add_argument("--embed-workers", type=int, default=8)
     ap.add_argument("--dry-run", action="store_true",
@@ -268,8 +303,14 @@ def main() -> None:
     )
     if args.images_embed:
         print(f"encoding images with the LoRA image tower ...")
+        mean_keys = None
+        if args.train_csv:
+            tr = pd.read_csv(args.train_csv)
+            mean_keys = {f"{f}/{i}" for f, i in zip(tr["Folder"], tr["image"])}
+            print(f"  {len(mean_keys)} training keys from {args.train_csv}")
         keys, img_emb, img_mean = encode_images(model, args.images, folders, args.device,
-                                                batch=args.embed_batch, workers=args.embed_workers)
+                                                batch=args.embed_batch, workers=args.embed_workers,
+                                                mean_keys=mean_keys)
         tables.update(
             clip_emb_image=img_emb.astype(np.float16),   # [N, D] per-image; fp16 halves the file
             clip_emb_image_keys=np.array(keys),          # "<Folder>/<file>.png", aligned to rows
