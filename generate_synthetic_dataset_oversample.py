@@ -59,7 +59,7 @@ def load_models(ckpt_path, device, num_classes, num_super_classes, image_size, n
     # recorded args for the npz path and code dim.
     uses_clip = any(k.startswith('y_embedder.clip_') for k in state)
     ck_args = checkpoint.get('args') if isinstance(checkpoint, dict) else None
-    clip_species = clip_coarse = None
+    clip_species = clip_coarse = clip_image_mean = None
     clip_code_dim = 0
     if uses_clip:
         npz_path = clip_embeddings or (getattr(ck_args, 'clip_embeddings', None) if ck_args else None)
@@ -73,8 +73,16 @@ def load_models(ckpt_path, device, num_classes, num_super_classes, image_size, n
         # it off the saved tensor when present (code_dim=0 means there is no code at all).
         code_w = state.get('y_embedder.code.weight')
         clip_code_dim = int(code_w.shape[1]) if code_w is not None else 0
+        # Image conditioning: take the per-class mean table straight from the checkpoint's
+        # own buffer rather than the npz. It is authoritative (the npz may lack the key, or
+        # be a different file), and its presence is exactly what distinguishes the
+        # text+image variant from text-only.
+        clip_image_mean = state.get('y_embedder.clip_image_mean')
+        if clip_image_mean is not None:
+            clip_image_mean = clip_image_mean.cpu().numpy()
         logging.info(f"CLIP conditioning: {npz_path} (model={z['clip_model']}, "
-                     f"dim={clip_species.shape[1]}, code_dim={clip_code_dim})")
+                     f"dim={clip_species.shape[1]}, code_dim={clip_code_dim}, "
+                     f"image={'yes' if clip_image_mean is not None else 'no'})")
     else:
         logging.info("Label conditioning (learned embedding table)")
 
@@ -86,6 +94,7 @@ def load_models(ckpt_path, device, num_classes, num_super_classes, image_size, n
         clip_species=clip_species,
         clip_coarse=clip_coarse,
         clip_code_dim=clip_code_dim,
+        clip_image_mean=clip_image_mean,
     ).to(device)
 
     model.load_state_dict(state)
