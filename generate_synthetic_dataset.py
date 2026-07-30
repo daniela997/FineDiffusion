@@ -38,7 +38,7 @@ def setup_logging():
 
 
 def load_models(ckpt_path, device, num_classes, num_super_classes, image_size, num_sampling_steps,
-                clip_embeddings=None):
+                clip_embeddings=None, image_bank=False):
     """Load FineDiffusion model and VAE.
 
     Handles BOTH conditioning types. A ClipEmbedder checkpoint carries clip_species/clip_coarse
@@ -60,6 +60,7 @@ def load_models(ckpt_path, device, num_classes, num_super_classes, image_size, n
     uses_clip = any(k.startswith('y_embedder.clip_') for k in state)
     ck_args = checkpoint.get('args') if isinstance(checkpoint, dict) else None
     clip_species = clip_coarse = clip_image_mean = None
+    image_bank_data = None
     clip_code_dim = 0
     if uses_clip:
         npz_path = clip_embeddings or (getattr(ck_args, 'clip_embeddings', None) if ck_args else None)
@@ -80,6 +81,22 @@ def load_models(ckpt_path, device, num_classes, num_super_classes, image_size, n
         clip_image_mean = state.get('y_embedder.clip_image_mean')
         if clip_image_mean is not None:
             clip_image_mean = clip_image_mean.cpu().numpy()
+        # Per-image embedding bank, for --image-sampling real. The model was trained on
+        # individual image embeddings (a fraction p_mean of them swapped for the class
+        # mean), so conditioning on a real one at sampling time is in distribution and
+        # needs no retraining -- unlike the mean, it varies within a class.
+        if image_bank and clip_image_mean is not None:
+            if 'clip_emb_image' not in z:
+                raise SystemExit(
+                    f"--image-sampling real needs per-image embeddings; {npz_path} has none. "
+                    f"Rebuild it with make_clip_embeddings.py --images-embed")
+            keys = [str(k) for k in z['clip_emb_image_keys']]
+            emb = z['clip_emb_image'].astype(np.float32)
+            by_class = {}
+            for row, k in enumerate(keys):
+                by_class.setdefault(k.split('/')[0], []).append(row)
+            image_bank_data = {c: emb[rows] for c, rows in by_class.items()}
+            logging.info(f"  per-image bank: {len(image_bank_data)} classes, {emb.shape[0]} embeddings")
         logging.info(f"CLIP conditioning: {npz_path} (model={z['clip_model']}, "
                      f"dim={clip_species.shape[1]}, code_dim={clip_code_dim}, "
                      f"image={'yes' if clip_image_mean is not None else 'no'})")
@@ -106,11 +123,12 @@ def load_models(ckpt_path, device, num_classes, num_super_classes, image_size, n
     
     # Create diffusion
     diffusion = create_diffusion(str(num_sampling_steps))
-    
-    return model, vae, diffusion
+
+    return model, vae, diffusion, image_bank_data
 
 
 def generate_images_for_class(
+    class_image_bank,
     class_idx,
     ml_class,
     target_count,
@@ -178,6 +196,13 @@ def generate_images_for_class(
                 y = torch.cat([y, y_super], 0)
             
             model_kwargs = dict(y=y, cfg_scale=cfg_scale)
+            if class_image_bank is not None:
+                # Draw a real per-image embedding for each sample instead of falling back to
+                # the class mean. Duplicated across the CFG halves so the null branch sees the
+                # same conditioning; ClipEmbedder swaps in the class mean for the null itself.
+                idx = torch.randint(0, class_image_bank.shape[0], (current_batch_size,))
+                e = class_image_bank[idx].to(device)
+                model_kwargs["image_emb"] = torch.cat([e, e], 0)
             
             # Use autocast for mixed precision (like in training)
             with torch.autocast(device_type='cuda', dtype=torch.float16):
@@ -217,6 +242,14 @@ def main():
     parser.add_argument("--cfg_scale", type=float, default=4.0, help="Classifier-free guidance scale")
     parser.add_argument("--shard", type=int, default=0, help="Shard index (0-based)")
     parser.add_argument("--num_shards", type=int, default=1, help="Total number of shards")
+    parser.add_argument("--image_sampling", "--image-sampling", default="mean",
+                        choices=["mean", "real"],
+                        help="text+image checkpoints only. 'mean' conditions every sample of a "
+                             "class on its class-mean image embedding, so conditioning is "
+                             "per-class and diversity comes from the noise alone. 'real' draws "
+                             "a random per-image embedding from that class instead, giving "
+                             "conditioning that varies within the class. The model was trained "
+                             "on individual embeddings, so both are in distribution.")
     parser.add_argument("--clip_embeddings", "--clip-embeddings", type=str, default=None,
                         help="Conditioning .npz for a CLIP-conditioned checkpoint. Only needed "
                              "if the path recorded in the checkpoint's args has moved; the "
@@ -245,11 +278,12 @@ def main():
         class_to_superclass_mapping[class_idx] = dataset.get_superclass(class_idx)
     
     # Load model
-    model, vae, diffusion = load_models(
+    model, vae, diffusion, image_bank = load_models(
         args.ckpt, device, 
         dataset.num_classes, dataset.num_superclasses,
         256, args.num_sampling_steps,
         clip_embeddings=args.clip_embeddings,
+        image_bank=(args.image_sampling == "real"),
     )
     # ClipEmbedder carries the coarse (Phylum) null in its own clip_coarse table and has no
     # class->superclass mapping to set.
@@ -283,6 +317,9 @@ def main():
         
         try:
             generate_images_for_class(
+                class_image_bank=(
+                    torch.from_numpy(image_bank[ml_class]).float()
+                    if image_bank and ml_class in image_bank else None),
                 class_idx=class_idx,
                 ml_class=ml_class,
                 target_count=count,

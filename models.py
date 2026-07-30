@@ -495,12 +495,13 @@ class DiT(nn.Module):
         x = self.unpatchify(x)  # (N, out_channels, H, W)
         return x
 
-    def _forward_clip_cfg(self, x, t, y, force_drop_ids):
+    def _forward_clip_cfg(self, x, t, y, force_drop_ids, image_emb=None):
         """Like forward(), but passes force_drop_ids to the ClipEmbedder so the dropped
-        samples are conditioned on the coarse (Phylum) CLIP null."""
+        samples are conditioned on the coarse (Phylum) CLIP null. `image_emb` lets the
+        caller supply per-sample image embeddings instead of the per-class mean."""
         x = self.x_embedder(x) + self.pos_embed
         t = self.t_embedder(t)
-        y = self.y_embedder(y, False, force_drop_ids=force_drop_ids)
+        y = self.y_embedder(y, False, force_drop_ids=force_drop_ids, image_emb=image_emb)
         c = t + y
         for block in self.blocks:
             x = block(x, c)
@@ -508,7 +509,7 @@ class DiT(nn.Module):
         x = self.unpatchify(x)
         return x
 
-    def forward_with_cfg(self, x, t, y, cfg_scale):
+    def forward_with_cfg(self, x, t, y, cfg_scale, image_emb=None):
         """
         Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
         """
@@ -524,7 +525,7 @@ class DiT(nn.Module):
             n = combined.shape[0]
             force_drop = torch.zeros(n, dtype=torch.long, device=combined.device)
             force_drop[n // 2:] = 1
-            model_out = self._forward_clip_cfg(combined, t, y, force_drop)
+            model_out = self._forward_clip_cfg(combined, t, y, force_drop, image_emb=image_emb)
         else:
             model_out = self.forward(combined, t, y)
         # For exact reproducibility reasons, we apply classifier-free guidance on only
