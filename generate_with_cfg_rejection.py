@@ -17,9 +17,10 @@ which is what makes best-of-N affordable on a 59,344-image set at all.
 TWO SETS ARE WRITTEN FROM ONE PASS so the comparison is controlled:
     <output_dir>_base/<class>/*.png      candidate 0 -- what plain generation would produce
     <output_dir>_sel/<class>/*.png       the best-ASD candidate
-Candidate 0's noise seed is identical to what the plain generator uses for that slot, so the
-only difference between the two sets is the selection policy -- not the seeds, not the count,
-not the conditioning.
+Candidate 0 is the no-selection control: drawn first, from the same distribution, written to
+_base whatever its score. It is NOT bit-identical to the earlier plain sets (those seed per
+accumulated-sample index over a different batch layout), so compare _base vs _sel -- both from
+this run -- rather than _sel against the earlier set's FID.
 
 CAVEAT worth measuring rather than assuming: on a 3-slot calibration of this model, ASD appeared
 to rank candidates by organism SIZE/CONTRAST rather than by validity (all samples were already
@@ -121,6 +122,15 @@ def main() -> None:
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--limit_per_class", type=int, default=None,
                     help="cap slots per class, for a quick FID-comparable subsample")
+    ap.add_argument("--image_sampling", "--image-sampling", default="mean",
+                    choices=("mean", "real"),
+                    help="conditioning at sampling time. 'mean' uses the class-mean embedding, "
+                         "which is what the EXISTING main sets used (generate_synthetic_dataset "
+                         "also defaults to mean and the pod runs passed no override), so it is "
+                         "the only setting that keeps a FID comparison against them valid. "
+                         "'real' conditions on each slot's own source-image embedding -- closer "
+                         "to how the model was trained, and an untried lever, but it changes two "
+                         "things at once if combined with selection.")
     ap.add_argument("--resume", action="store_true")
     args = ap.parse_args()
 
@@ -146,7 +156,7 @@ def main() -> None:
                      args.num_sampling_steps, clip_embeddings=args.npz)
     model, vae, diffusion = _l[0], _l[1], _l[2]
     use_img = hasattr(model.y_embedder, "clip_image_mean")
-    logging.info(f"image conditioning: {use_img}")
+    logging.info(f"image conditioning: {use_img}, sampling={args.image_sampling}")
 
     for n, cls in enumerate(mine, 1):
         srcs = sorted(per_class[cls])
@@ -164,16 +174,20 @@ def main() -> None:
             bs = min(args.batch_size, len(srcs) - i)
             slots = srcs[i:i + bs]
 
-            # One conditioning embedding per slot (mean when the class has no per-image entry).
-            if use_img:
+            # Conditioning per slot. Default 'mean' matches the existing main sets, so the
+            # only variable versus them is the selection policy.
+            if not use_img:
+                e_slot = None
+            elif args.image_sampling == "mean":
+                m = model.y_embedder.clip_image_mean[ci].cpu().numpy()
+                e_slot = torch.from_numpy(np.stack([m] * bs)).to(args.device)
+            else:
                 e = []
                 for s in slots:
                     k = f"{cls}/{s}"
                     e.append(emb_all[rows[k]] if k in rows
                              else model.y_embedder.clip_image_mean[ci].cpu().numpy())
                 e_slot = torch.from_numpy(np.stack(e)).to(args.device)
-            else:
-                e_slot = None
 
             # Candidate noise. Candidate 0 is the no-selection control: it is drawn first, from
             # the same distribution, and is written to _base regardless of its score. It is NOT
