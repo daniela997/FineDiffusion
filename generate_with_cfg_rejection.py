@@ -114,8 +114,10 @@ def main() -> None:
     ap.add_argument("--tau", type=int, default=10, help="prefix steps used to score candidates")
     ap.add_argument("--num_sampling_steps", type=int, default=250)
     ap.add_argument("--cfg_scale", type=float, default=4.0)
-    ap.add_argument("--batch_size", type=int, default=8,
-                    help="SLOTS per batch; each slot expands to n_candidates during scoring")
+    ap.add_argument("--batch_size", type=int, default=4,
+                    help="SLOTS per batch. Each slot is scored as n_candidates separate passes "
+                         "over a 2*batch_size batch (CFG doubles it), so peak memory scales with "
+                         "batch_size, not with n_candidates. 4 fits a 24GB card at N=4; 8 OOMs.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--num_shards", type=int, default=1)
@@ -200,23 +202,30 @@ def main() -> None:
                 cand_z.append(torch.randn(bs, 4, 32, 32, device=args.device))
 
             y = torch.full((bs,), ci, dtype=torch.long, device=args.device)
-            with torch.autocast("cuda", dtype=torch.float16):
-                scores = torch.stack([
-                    asd_prefix(model, diffusion, cz, y, e_slot, args.cfg_scale,
-                               args.tau, args.device)
-                    for cz in cand_z])                       # [N, bs]
-                best = scores.argmax(0)                       # [bs]
-
-                # Full denoise for candidate 0 (baseline) and for the winner (selected).
-                base_imgs = sample_full(model, vae, diffusion, cand_z[0], y, e_slot,
-                                        args.cfg_scale, args.device)
-                sel_z = torch.stack([cand_z[best[k]][k] for k in range(bs)])
-                sel_imgs = sample_full(model, vae, diffusion, sel_z, y, e_slot,
-                                       args.cfg_scale, args.device)
-
             names = [f"synthetic_{i + k:05d}.png" for k in range(bs)]
-            save(base_imgs, [base_dir / cls / nm for nm in names])
-            save(sel_imgs, [sel_dir / cls / nm for nm in names])
+
+            # Score the candidates, freeing each prefix run before the next: the scoring loop
+            # is what makes this memory-hungry (N passes over a 2*bs batch), and holding all N
+            # plus two decoded image tensors at once OOMs a 24GB card.
+            with torch.autocast("cuda", dtype=torch.float16):
+                scores = []
+                for cz in cand_z:
+                    scores.append(asd_prefix(model, diffusion, cz, y, e_slot,
+                                             args.cfg_scale, args.tau, args.device))
+                    torch.cuda.empty_cache()
+                best = torch.stack(scores).argmax(0)          # [bs]
+
+            # Decode and WRITE each set before starting the next, so only one batch of decoded
+            # images is resident at a time.
+            sel_z = torch.stack([cand_z[best[k]][k] for k in range(bs)])
+            for z_use, out_dir in ((cand_z[0], base_dir), (sel_z, sel_dir)):
+                with torch.autocast("cuda", dtype=torch.float16):
+                    imgs = sample_full(model, vae, diffusion, z_use, y, e_slot,
+                                       args.cfg_scale, args.device)
+                save(imgs, [out_dir / cls / nm for nm in names])
+                del imgs
+                torch.cuda.empty_cache()
+            del cand_z, sel_z, scores
             i += bs
         torch.cuda.empty_cache()
 
