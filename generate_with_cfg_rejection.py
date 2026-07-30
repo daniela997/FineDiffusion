@@ -51,32 +51,44 @@ from generate_synthetic_dataset import load_models
 def asd_prefix(model, diffusion, z, y, image_emb, cfg_scale, tau, device):
     """Denoise `tau` steps and return each candidate's mean ||eps_cond - eps_uncond||.
 
+    The score difference is taken from _forward_clip_cfg's OUTPUT, not from a hook on
+    final_layer: final_layer emits patch tokens of shape [B, num_patches, patch_dim] BEFORE
+    unpatchify, so slicing [:, :3] there takes three PATCHES, not three image channels, and
+    the resulting "ASD" is an arbitrary corner of the latent. (That bug produced scores ~6x
+    too small and uncorrelated with the true score gap.)
+
     Runs the same guided loop as full sampling but stops early: p_sample_loop_progressive
-    yields per-step, so we break after tau steps and never pay for the remaining 240.
+    yields per-step, so we break after tau steps and never pay for the remaining steps.
     """
     b = z.shape[0]
     gaps = []
 
-    def hook(_m, _i, output):
-        # Guidance is applied to the FIRST 3 CHANNELS only (models.py), so the score
-        # difference lives there.
-        eps = output[:, :3]
-        cond, uncond = eps[: len(eps) // 2], eps[len(eps) // 2:]
-        gaps.append((cond - uncond).flatten(1).norm(dim=-1).detach().float().cpu())
+    def fn(x_t, t, **kw):
+        # Reproduce forward_with_cfg's own null construction, then keep both halves so the
+        # true cond/uncond split is available. models.py applies guidance to the first 3
+        # channels only, which is where the score difference lives.
+        half = x_t[: len(x_t) // 2]
+        combined = torch.cat([half, half], dim=0)
+        n = combined.shape[0]
+        force_drop = torch.zeros(n, dtype=torch.long, device=combined.device)
+        force_drop[n // 2:] = 1
+        out = model._forward_clip_cfg(combined, t, kw["y"], force_drop,
+                                      image_emb=kw.get("image_emb"))
+        eps, rest = out[:, :3], out[:, 3:]
+        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+        gaps.append((cond_eps - uncond_eps).flatten(1).norm(dim=-1).detach().float().cpu())
+        half_eps = uncond_eps + kw["cfg_scale"] * (cond_eps - uncond_eps)
+        return torch.cat([torch.cat([half_eps, half_eps], dim=0), rest], dim=1)
 
-    handle = model.final_layer.register_forward_hook(hook)
     zz, yy = torch.cat([z, z], 0), torch.cat([y, y], 0)
     kw = dict(y=yy, cfg_scale=cfg_scale)
     if image_emb is not None:
         kw["image_emb"] = torch.cat([image_emb, image_emb], 0)
-    try:
-        for i, _ in enumerate(diffusion.p_sample_loop_progressive(
-                model.forward_with_cfg, zz.shape, zz, clip_denoised=False,
-                model_kwargs=kw, progress=False, device=device)):
-            if i + 1 >= tau:
-                break
-    finally:
-        handle.remove()
+    for i, _ in enumerate(diffusion.p_sample_loop_progressive(
+            fn, zz.shape, zz, clip_denoised=False,
+            model_kwargs=kw, progress=False, device=device)):
+        if i + 1 >= tau:
+            break
     if not gaps:
         return torch.zeros(b)
     return torch.stack(gaps, dim=1).mean(dim=1)          # [b]
@@ -165,7 +177,12 @@ def main() -> None:
         if args.limit_per_class:
             srcs = srcs[: args.limit_per_class]
         ci = classes.index(cls)
-        done = len(list((sel_dir / cls).glob("*.png"))) if args.resume else 0
+        # Resume on the MINIMUM of the two sets. _base and _sel are written together per
+        # batch and must correspond slot-for-slot, so a class is complete only when both
+        # halves are. This also means purging one half correctly forces the other to redo:
+        # a fixed-metric _sel must not be paired with a stale _base.
+        done = min(len(list((base_dir / cls).glob("*.png"))),
+                   len(list((sel_dir / cls).glob("*.png")))) if args.resume else 0
         if done >= len(srcs):
             logging.info(f"[{n}/{len(mine)}] {cls}: complete ({done})")
             continue
